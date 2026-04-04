@@ -323,7 +323,9 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot) const {
     }
 
     if (!activeError_.empty()) {
-        drawErrorOverlay(rows, cols);
+        drawModalOverlay(rows, cols, "Error", "Playback backend or decode failure", activeError_);
+    } else if (!modalBody_.empty()) {
+        drawModalOverlay(rows, cols, modalTitle_, modalSubtitle_, modalBody_);
     }
 
     refresh();
@@ -563,10 +565,15 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
     mvprintw(top + height - 1, left, "%s", trimText(snapshot.lyrics->message, width).c_str());
 }
 
-void TerminalUI::drawErrorOverlay(int rows, int cols) const {
+void TerminalUI::drawModalOverlay(
+    int rows,
+    int cols,
+    const std::string& title,
+    const std::string& subtitle,
+    const std::string& body) const {
     const int overlayWidth = std::min(cols - 8, std::max(52, cols * 2 / 3));
-    const auto wrappedError = wrapText(activeError_, overlayWidth - 6);
-    const int messageLines = std::min<int>(wrappedError.size(), std::max(3, rows - 14));
+    const auto wrappedBody = wrapText(body, overlayWidth - 6);
+    const int messageLines = std::min<int>(wrappedBody.size(), std::max(3, rows - 14));
     const int overlayHeight = std::min(rows - 6, 6 + messageLines);
     const int top = std::max(2, (rows - overlayHeight) / 2);
     const int left = std::max(2, (cols - overlayWidth) / 2);
@@ -599,8 +606,8 @@ void TerminalUI::drawErrorOverlay(int rows, int cols) const {
     box(overlay, 0, 0);
 
     wattron(overlay, A_BOLD);
-    mvwprintw(overlay, 0, 2, " Error ");
-    mvwprintw(overlay, 1, 2, "Playback backend or decode failure");
+    mvwprintw(overlay, 0, 2, " %s ", title.c_str());
+    mvwprintw(overlay, 1, 2, "%s", trimText(subtitle, overlayWidth - 4).c_str());
     wattroff(overlay, A_BOLD);
 
     for (int index = 0; index < messageLines; ++index) {
@@ -610,10 +617,10 @@ void TerminalUI::drawErrorOverlay(int rows, int cols) const {
             2,
             "%-*s",
             overlayWidth - 4,
-            wrappedError[static_cast<std::size_t>(index)].c_str());
+            wrappedBody[static_cast<std::size_t>(index)].c_str());
     }
 
-    if (static_cast<int>(wrappedError.size()) > messageLines) {
+    if (static_cast<int>(wrappedBody.size()) > messageLines) {
         mvwprintw(overlay, 2 + messageLines - 1, overlayWidth - 6, "%s", "...");
     }
 
@@ -634,7 +641,7 @@ void TerminalUI::drawErrorOverlay(int rows, int cols) const {
 }
 
 void TerminalUI::handleInput(int key) {
-    if (!activeError_.empty()) {
+    if (!activeError_.empty() || !modalBody_.empty()) {
         switch (key) {
             case 'q':
             case 'Q':
@@ -644,8 +651,13 @@ void TerminalUI::handleInput(int key) {
             case '\n':
             case KEY_ENTER:
             case ' ':
-                dismissedError_ = activeError_;
+                if (!activeError_.empty()) {
+                    dismissedError_ = activeError_;
+                }
                 activeError_.clear();
+                modalTitle_.clear();
+                modalSubtitle_.clear();
+                modalBody_.clear();
                 return;
             default:
                 return;
@@ -700,6 +712,14 @@ void TerminalUI::handleInput(int key) {
         case 'T':
             detailMode_ = detailMode_ == DetailMode::Visualizer ? DetailMode::Lyrics : DetailMode::Visualizer;
             return;
+        case 'w':
+        case 'W':
+            openWarrantyOverlay();
+            return;
+        case 'c':
+        case 'C':
+            openConditionsOverlay();
+            return;
         default:
             return;
     }
@@ -717,6 +737,24 @@ void TerminalUI::syncErrorOverlay(const PlaybackSnapshot& snapshot) {
     }
 
     activeError_ = snapshot.lastError;
+}
+
+void TerminalUI::openWarrantyOverlay() {
+    modalTitle_ = "Warranty";
+    modalSubtitle_ = "RetroWave legal notice";
+    modalBody_ =
+        "RetroWave Copyright (C) 2026 Viktor Voloshko. "
+        "This program comes with ABSOLUTELY NO WARRANTY. "
+        "RetroWave is distributed under GPLv3. See LICENSE.txt for the full disclaimer and legal terms.";
+}
+
+void TerminalUI::openConditionsOverlay() {
+    modalTitle_ = "Conditions";
+    modalSubtitle_ = "RetroWave legal notice";
+    modalBody_ =
+        "RetroWave Copyright (C) 2026 Viktor Voloshko. "
+        "This is free software, and you are welcome to redistribute it under certain conditions. "
+        "RetroWave is licensed under GPLv3. See LICENSE.txt for the complete redistribution and modification terms.";
 }
 
 }  // namespace retrowave

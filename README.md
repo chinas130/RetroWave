@@ -124,6 +124,8 @@ MANPATH="$PWD/man" man retrowave
 - `p`: play previous track
 - `+` / `-`: adjust volume
 - `t`: toggle visualizer and lyrics panel
+- `w`: show warranty notice
+- `c`: show redistribution notice
 - `q`: quit
 
 ## Lyrics
@@ -202,4 +204,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-No license file has been added yet. If you plan to publish this publicly, add one before inviting outside contributions.
+The repository currently includes a project notice in [NOTICE](NOTICE):
+
+```text
+RetroWave  Copyright (C) 2026 Viktor Voloshko
+This program comes with ABSOLUTELY NO WARRANTY; for details press w.
+This is free software, and you are welcome to redistribute it
+under certain conditions; press c for details.
+```
+
+That notice is visible in the TUI through the `w` and `c` hotkeys.
+
+The full license text is included in [LICENSE.txt](LICENSE.txt). RetroWave is currently distributed under GPLv3.
