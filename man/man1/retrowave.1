@@ -1,0 +1,106 @@
+.Dd April 4, 2026
+.Dt RETROWAVE 1
+.Os
+.Sh NAME
+.Nm retrowave
+.Nd terminal music player with ASCII album art, playlists, and LRC lyrics
+.Sh SYNOPSIS
+.Nm
+.Op Ar file_or_directory ...
+.Sh DESCRIPTION
+.Nm
+is a local terminal music player for browsing directories of music, decoding tracks with FFmpeg, rendering album art as ASCII, and showing synchronized lyrics from nearby
+.Pa .lrc
+files.
+If no input paths are provided,
+.Nm
+scans the current working directory recursively for supported audio files.
+.Sh FEATURES
+.Bl -bullet -compact
+.It
+Playlist navigation in an
+.Xr ncurses 3
+interface
+.It
+Playback through macOS AudioToolbox
+.It
+ASCII album card rendered from embedded cover art or nearby image files
+.It
+Animated visualizer with auto gain
+.It
+Lyrics mode backed by local
+.Pa .lrc
+files
+.El
+.Sh HOTKEYS
+.Bl -tag -width Ds
+.It Up / Down
+Move playlist selection
+.It Enter
+Play selected track
+.It Space
+Pause or resume playback
+.It n
+Play next track
+.It p
+Play previous track
+.It + / -
+Adjust volume
+.It t
+Toggle between visualizer and lyrics panel
+.It q
+Quit
+.El
+.Sh LYRICS
+Lyrics are loaded from a file with the same stem as the current track, for example:
+.Pp
+.Dl song.mp3
+.Dl song.lrc
+.Pp
+Timed LRC lines are highlighted and auto-scrolled during playback.
+If no matching
+.Pa .lrc
+file is found, the lyrics panel reports that lyrics are unavailable.
+.Sh ALBUM ART
+Album art is loaded from embedded attached pictures when available.
+If embedded art is missing,
+.Nm
+looks for nearby files named:
+.Pp
+.Dl cover.jpg
+.Dl cover.png
+.Dl folder.jpg
+.Dl front.jpg
+.Dl album.jpg
+.Sh SUPPORTED FORMATS
+.Nm
+relies on FFmpeg for decoding and supports common formats including:
+.Pp
+.Dl mp3, flac, wav, m4a, ogg, opus, aac, aiff, alac, wma
+.Sh EXAMPLES
+.Bl -tag -width Ds
+.It
+Play everything under the current directory:
+.Pp
+.Dl retrowave
+.It
+Play a specific music folder:
+.Pp
+.Dl retrowave ~/Music
+.It
+Open this manual from the project root:
+.Pp
+.Dl MANPATH="$PWD/man" man retrowave
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa man/man1/retrowave.1
+Project manual page
+.It Pa *.lrc
+Optional local lyrics files placed next to tracks
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh AUTHORS
+.Nm
+was built as a local C++ terminal player project.
