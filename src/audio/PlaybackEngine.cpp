@@ -1,29 +1,45 @@
 #include "audio/PlaybackEngine.h"
 
 #include "audio/AudioOutput.h"
+#include "audio/AudioStreamDecoder.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <thread>
+#include <vector>
 
 namespace retrowave {
 namespace {
 
 constexpr float kInt16Scale = 32767.0F;
-constexpr std::size_t kVisualizerBins = 64;
+constexpr std::size_t kStreamBufferFrames = static_cast<std::size_t>(AudioOutput::sampleRate()) / 2;
+constexpr std::size_t kDecoderChunkFrames = 2048;
+constexpr auto kDecoderSleep = std::chrono::milliseconds(12);
 
 float clamp(float value, float minimum, float maximum) {
     return std::max(minimum, std::min(maximum, value));
 }
 
-std::vector<float> buildVisualizerWindow(const std::int16_t* samples, std::size_t frameCount, int channels) {
-    std::vector<float> bins(kVisualizerBins, 0.0F);
+std::int16_t applyGain(std::int16_t sample, float gain) {
+    const float scaled = static_cast<float>(sample) * gain;
+    const float clamped = clamp(scaled, -kInt16Scale, kInt16Scale);
+    return static_cast<std::int16_t>(std::lrint(clamped));
+}
+
+std::array<float, kPlaybackVisualizerBins> buildVisualizerWindow(
+    const std::int16_t* samples,
+    std::size_t frameCount,
+    int channels) {
+    std::array<float, kPlaybackVisualizerBins> bins{};
     if (samples == nullptr || frameCount == 0 || channels <= 0) {
         return bins;
     }
 
-    const auto framesPerBin = std::max<std::size_t>(1, frameCount / kVisualizerBins);
+    const auto framesPerBin = std::max<std::size_t>(1, frameCount / kPlaybackVisualizerBins);
 
-    for (std::size_t bin = 0; bin < kVisualizerBins; ++bin) {
+    for (std::size_t bin = 0; bin < kPlaybackVisualizerBins; ++bin) {
         const auto frameStart = bin * framesPerBin;
         if (frameStart >= frameCount) {
             break;
@@ -53,8 +69,9 @@ std::vector<float> buildVisualizerWindow(const std::int16_t* samples, std::size_
 
 }  // namespace
 
-PlaybackEngine::PlaybackEngine(Playlist playlist) : playlist_(std::move(playlist)) {
-    visualizerBins_.assign(kVisualizerBins, 0.0F);
+PlaybackEngine::PlaybackEngine(Playlist playlist)
+    : playlist_(std::move(playlist)),
+      ringBuffer_(kStreamBufferFrames, 2) {
     try {
         output_ = std::make_unique<AudioOutput>(
             [this](std::int16_t* destination, std::size_t frames) { return renderFrames(destination, frames); });
@@ -69,7 +86,9 @@ PlaybackEngine::PlaybackEngine(Playlist playlist) : playlist_(std::move(playlist
     }
 }
 
-PlaybackEngine::~PlaybackEngine() = default;
+PlaybackEngine::~PlaybackEngine() {
+    stopDecoderThread();
+}
 
 void PlaybackEngine::update() {
     if (pendingAdvance_.exchange(false)) {
@@ -80,6 +99,25 @@ void PlaybackEngine::update() {
             paused_.store(true);
             trackEnded_.store(false);
         }
+    }
+
+    std::filesystem::path activePath;
+    {
+        std::lock_guard lock(mutex_);
+        if (!currentTrack_) {
+            return;
+        }
+        activePath = currentTrack_->metadata.path;
+    }
+
+    auto waveform = waveformCache_.get(activePath);
+    if (!waveform) {
+        return;
+    }
+
+    std::lock_guard lock(mutex_);
+    if (currentTrack_ && currentTrack_->metadata.path == activePath && currentTrack_->metadata.waveform != *waveform) {
+        currentTrack_->metadata.waveform = std::move(*waveform);
     }
 }
 
@@ -94,9 +132,47 @@ bool PlaybackEngine::playIndexInternal(std::size_t index) {
 
     loading_.store(true);
     lastError_.clear();
+    stopDecoderThread();
 
     try {
-        auto decoded = decoder_.decode(playlist_.at(index).path);
+        const auto trackPath = playlist_.pathAt(index);
+        auto decoded = decoder_.decode(trackPath);
+        if (auto cachedWaveform = waveformCache_.get(trackPath)) {
+            decoded.metadata.waveform = std::move(*cachedWaveform);
+        } else {
+            waveformCache_.request(trackPath);
+        }
+
+        auto streamDecoder = std::make_unique<AudioStreamDecoder>();
+        streamDecoder->open(trackPath);
+
+        ringBuffer_.reset(kStreamBufferFrames, streamDecoder->channels());
+
+        // Prime the buffer so playback starts immediately after track switch.
+        std::vector<std::int16_t> prefill(kDecoderChunkFrames * static_cast<std::size_t>(streamDecoder->channels()));
+        while (ringBuffer_.availableFrames() < AudioOutput::framesPerBuffer() * 2 && !streamDecoder->eof()) {
+            const auto framesRead = streamDecoder->readFrames(prefill.data(), kDecoderChunkFrames);
+            if (framesRead == 0) {
+                ringBuffer_.markEof();
+                break;
+            }
+
+            std::size_t pushedFrames = 0;
+            while (pushedFrames < framesRead) {
+                const auto written = ringBuffer_.push(
+                    prefill.data() + static_cast<std::ptrdiff_t>(
+                        pushedFrames * static_cast<std::size_t>(streamDecoder->channels())),
+                    framesRead - pushedFrames);
+                if (written == 0) {
+                    break;
+                }
+                pushedFrames += written;
+            }
+
+            if (pushedFrames < framesRead) {
+                break;
+            }
+        }
 
         {
             std::lock_guard lock(mutex_);
@@ -106,15 +182,18 @@ bool PlaybackEngine::playIndexInternal(std::size_t index) {
             paused_.store(false);
             trackEnded_.store(false);
             level_.store(0.0F);
-            visualizerBins_.assign(kVisualizerBins, 0.0F);
+            streamDecoder_ = std::move(streamDecoder);
         }
 
+        stopDecoder_.store(false);
+        decoderThread_ = std::thread([this]() { decoderLoop(); });
         loading_.store(false);
         return true;
     } catch (const std::exception& error) {
         std::lock_guard lock(mutex_);
         lastError_ = error.what();
         loading_.store(false);
+        ringBuffer_.clear();
         return false;
     }
 }
@@ -160,23 +239,26 @@ PlaybackSnapshot PlaybackEngine::snapshot() const {
         return result;
     }
 
-    const auto totalFrames =
-        currentTrack_->samples.size() / static_cast<std::size_t>(std::max(1, currentTrack_->channels));
+    const auto totalFrames = static_cast<std::size_t>(
+        currentTrack_->metadata.durationSeconds * AudioOutput::sampleRate());
     const auto renderedFrame = std::min(playbackFrame_.load(), totalFrames);
     const auto latencyFrames = output_ ? std::min(renderedFrame, AudioOutput::queuedLatencyFrames()) : 0UL;
     const auto currentFrame = renderedFrame - latencyFrames;
 
     result.hasTrack = true;
-    result.title = currentTrack_->title;
-    result.artist = currentTrack_->artist;
-    result.album = currentTrack_->album;
-    result.path = currentTrack_->path.string();
-    result.durationSeconds = currentTrack_->durationSeconds;
-    result.positionSeconds = static_cast<double>(currentFrame) / static_cast<double>(currentTrack_->sampleRate);
-    result.waveform = currentTrack_->waveform;
-    result.visualizer = visualizerBins_;
-    result.albumArt = currentTrack_->albumArt;
-    result.lyrics = currentTrack_->lyrics;
+    result.title = currentTrack_->metadata.title;
+    result.artist = currentTrack_->metadata.artist;
+    result.album = currentTrack_->metadata.album;
+    result.path = currentTrack_->metadata.path.string();
+    result.durationSeconds = currentTrack_->metadata.durationSeconds;
+    result.positionSeconds = static_cast<double>(currentFrame) / AudioOutput::sampleRate();
+    result.waveform = currentTrack_->metadata.waveform;
+    const auto activeBuffer = activeVisualizerBuffer_.load(std::memory_order_acquire);
+    result.visualizer.assign(
+        visualizerBuffers_[static_cast<std::size_t>(activeBuffer)].begin(),
+        visualizerBuffers_[static_cast<std::size_t>(activeBuffer)].end());
+    result.albumArt = currentTrack_->metadata.albumArt;
+    result.lyrics = currentTrack_->metadata.lyrics;
     return result;
 }
 
@@ -184,62 +266,126 @@ const Playlist& PlaybackEngine::playlist() const noexcept {
     return playlist_;
 }
 
-std::size_t PlaybackEngine::renderFrames(std::int16_t* destination, std::size_t frames) {
-    std::lock_guard lock(mutex_);
+void PlaybackEngine::publishVisualizer(const std::array<float, kPlaybackVisualizerBins>& bins) noexcept {
+    const int backBuffer = 1 - activeVisualizerBuffer_.load(std::memory_order_relaxed);
+    visualizerBuffers_[static_cast<std::size_t>(backBuffer)] = bins;
+    activeVisualizerBuffer_.store(backBuffer, std::memory_order_release);
+}
 
-    if (!currentTrack_ || paused_.load() || loading_.load()) {
-        std::fill(destination, destination + frames * 2, 0);
-        level_.store(0.0F);
-        std::fill(visualizerBins_.begin(), visualizerBins_.end(), 0.0F);
-        return frames;
+void PlaybackEngine::stopDecoderThread() {
+    stopDecoder_.store(true);
+    if (decoderThread_.joinable()) {
+        decoderThread_.join();
     }
 
-    const auto totalFrames =
-        currentTrack_->samples.size() / static_cast<std::size_t>(std::max(1, currentTrack_->channels));
-    auto frameIndex = playbackFrame_.load();
+    std::lock_guard lock(mutex_);
+    if (streamDecoder_) {
+        streamDecoder_->close();
+        streamDecoder_.reset();
+    }
+    ringBuffer_.clear();
+    ringBuffer_.clearEof();
+}
 
-    if (frameIndex >= totalFrames) {
-        std::fill(destination, destination + frames * 2, 0);
-        level_.store(0.0F);
-        std::fill(visualizerBins_.begin(), visualizerBins_.end(), 0.0F);
+void PlaybackEngine::decoderLoop() {
+    std::vector<std::int16_t> decodeBuffer(kDecoderChunkFrames * 2, 0);
 
-        if (!trackEnded_.exchange(true)) {
-            pendingAdvance_.store(true);
+    while (!stopDecoder_.load()) {
+        AudioStreamDecoder* streamDecoder = nullptr;
+        {
+            std::lock_guard lock(mutex_);
+            streamDecoder = streamDecoder_.get();
         }
 
+        if (streamDecoder == nullptr) {
+            return;
+        }
+
+        if (ringBuffer_.freeFrames() < kDecoderChunkFrames / 2) {
+            std::this_thread::sleep_for(kDecoderSleep);
+            continue;
+        }
+
+        try {
+            const auto framesRead = streamDecoder->readFrames(decodeBuffer.data(), kDecoderChunkFrames);
+            if (framesRead == 0) {
+                ringBuffer_.markEof();
+                return;
+            }
+
+            std::size_t pushedFrames = 0;
+            while (pushedFrames < framesRead && !stopDecoder_.load()) {
+                const auto written = ringBuffer_.push(
+                    decodeBuffer.data() + static_cast<std::ptrdiff_t>(pushedFrames * 2),
+                    framesRead - pushedFrames);
+                if (written == 0) {
+                    std::this_thread::sleep_for(kDecoderSleep);
+                    continue;
+                }
+                pushedFrames += written;
+            }
+        } catch (const std::exception& error) {
+            std::lock_guard lock(mutex_);
+            lastError_ = error.what();
+            ringBuffer_.markEof();
+            return;
+        }
+    }
+}
+
+std::size_t PlaybackEngine::renderFrames(std::int16_t* destination, std::size_t frames) {
+    if (destination == nullptr || frames == 0) {
+        return 0;
+    }
+
+    if (paused_.load() || loading_.load()) {
+        std::fill(destination, destination + frames * 2, 0);
+        level_.store(0.0F);
+        publishVisualizer({});
         return frames;
     }
 
-    const auto remainingFrames = totalFrames - frameIndex;
-    const auto framesToWrite = std::min(frames, remainingFrames);
-    const float volume = volume_.load();
+    {
+        std::lock_guard lock(mutex_);
+        if (!currentTrack_) {
+            std::fill(destination, destination + frames * 2, 0);
+            level_.store(0.0F);
+            publishVisualizer({});
+            return frames;
+        }
+    }
+
+    const auto framesRead = ringBuffer_.pop(destination, frames);
+    const int channels = std::max(1, ringBuffer_.channels());
+    const float gain = volume_.load();
+
+    if (framesRead < frames) {
+        std::fill(
+            destination + framesRead * static_cast<std::size_t>(channels),
+            destination + frames * static_cast<std::size_t>(channels),
+            0);
+    }
 
     float peak = 0.0F;
-    for (std::size_t frame = 0; frame < framesToWrite; ++frame) {
-        for (int channel = 0; channel < currentTrack_->channels; ++channel) {
-            const auto sampleIndex =
-                (frameIndex + frame) * static_cast<std::size_t>(currentTrack_->channels) + static_cast<std::size_t>(channel);
-            const float sample =
-                clamp(static_cast<float>(currentTrack_->samples[sampleIndex]) / kInt16Scale * volume, -1.0F, 1.0F);
+    for (std::size_t frame = 0; frame < framesRead; ++frame) {
+        for (int channel = 0; channel < channels; ++channel) {
+            const auto sampleIndex = frame * static_cast<std::size_t>(channels) + static_cast<std::size_t>(channel);
+            destination[sampleIndex] = applyGain(destination[sampleIndex], gain);
+            const float sample = static_cast<float>(destination[sampleIndex]) / kInt16Scale;
             peak = std::max(peak, std::abs(sample));
-            destination[frame * static_cast<std::size_t>(currentTrack_->channels) + static_cast<std::size_t>(channel)] =
-                static_cast<std::int16_t>(std::lrint(sample * kInt16Scale));
         }
     }
 
-    if (framesToWrite < frames) {
-        std::fill(
-            destination + framesToWrite * static_cast<std::size_t>(currentTrack_->channels),
-            destination + frames * static_cast<std::size_t>(currentTrack_->channels),
-            0);
+    playbackFrame_.store(playbackFrame_.load() + framesRead);
+    level_.store(peak);
+    publishVisualizer(buildVisualizerWindow(destination, framesRead, channels));
+
+    if (framesRead < frames && ringBuffer_.eof()) {
         if (!trackEnded_.exchange(true)) {
             pendingAdvance_.store(true);
         }
     }
 
-    playbackFrame_.store(frameIndex + framesToWrite);
-    level_.store(peak);
-    visualizerBins_ = buildVisualizerWindow(destination, framesToWrite, currentTrack_->channels);
     return frames;
 }
 

@@ -20,18 +20,19 @@ struct AlbumArt {
     }
 };
 
-struct DecodedTrack {
+struct TrackMetadata {
     std::filesystem::path path;
     std::string title;
     std::string artist;
     std::string album;
-    int sampleRate = 44100;
-    int channels = 2;
     double durationSeconds = 0.0;
-    std::vector<std::int16_t> samples;
     std::vector<float> waveform;
     std::shared_ptr<const AlbumArt> albumArt;
     std::shared_ptr<const LyricsData> lyrics;
+};
+
+struct DecodedTrack {
+    TrackMetadata metadata;
 };
 
 class AudioDecoder {

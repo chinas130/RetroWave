@@ -1,8 +1,11 @@
 #pragma once
 
 #include "audio/AudioDecoder.h"
+#include "audio/AudioRingBuffer.h"
+#include "audio/WaveformCache.h"
 #include "core/Playlist.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -10,10 +13,13 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace retrowave {
 
 class AudioOutput;
+class AudioStreamDecoder;
+inline constexpr std::size_t kPlaybackVisualizerBins = 64;
 
 struct PlaybackSnapshot {
     bool hasTrack = false;
@@ -54,21 +60,30 @@ class PlaybackEngine {
     [[nodiscard]] const Playlist& playlist() const noexcept;
 
   private:
+    void stopDecoderThread();
+    void decoderLoop();
     std::size_t renderFrames(std::int16_t* destination, std::size_t frames);
     bool playIndexInternal(std::size_t index);
+    void publishVisualizer(const std::array<float, kPlaybackVisualizerBins>& bins) noexcept;
 
     Playlist playlist_;
     AudioDecoder decoder_;
+    WaveformCache waveformCache_;
     std::unique_ptr<AudioOutput> output_;
+    std::unique_ptr<AudioStreamDecoder> streamDecoder_;
+    AudioRingBuffer ringBuffer_;
+    std::thread decoderThread_;
 
     mutable std::mutex mutex_;
     std::optional<DecodedTrack> currentTrack_;
     std::size_t currentIndex_ = 0;
     std::string lastError_;
     std::string audioError_;
-    std::vector<float> visualizerBins_;
+    std::array<std::array<float, kPlaybackVisualizerBins>, 2> visualizerBuffers_{};
+    std::atomic<int> activeVisualizerBuffer_{0};
 
     std::atomic<std::size_t> playbackFrame_{0};
+    std::atomic<bool> stopDecoder_{false};
     std::atomic<bool> paused_{false};
     std::atomic<bool> loading_{false};
     std::atomic<bool> pendingAdvance_{false};

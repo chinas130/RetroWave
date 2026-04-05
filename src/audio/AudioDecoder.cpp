@@ -12,22 +12,17 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
-#include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
-#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
 
 namespace retrowave {
 namespace {
 
-constexpr int kOutputSampleRate = 44100;
-constexpr int kOutputChannels = 2;
 constexpr int kWaveformBins = 160;
 constexpr int kArtMaxWidth = 72;
 constexpr int kArtMaxHeight = 48;
-constexpr float kInt16Scale = 32767.0F;
 
 std::string ffmpegError(int errorCode) {
     char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
@@ -46,34 +41,34 @@ using FormatContextPtr = ScopedPtr<AVFormatContext, avformat_close_input>;
 using CodecContextPtr = ScopedPtr<AVCodecContext, avcodec_free_context>;
 using FramePtr = ScopedPtr<AVFrame, av_frame_free>;
 using PacketPtr = ScopedPtr<AVPacket, av_packet_free>;
-using SwrContextPtr = ScopedPtr<SwrContext, swr_free>;
 using SwsContextPtr = std::unique_ptr<SwsContext, decltype(&sws_freeContext)>;
 
-std::vector<float> buildWaveform(const std::vector<std::int16_t>& samples, int channels) {
-    std::vector<float> waveform(kWaveformBins, 0.0f);
-    if (samples.empty() || channels <= 0) {
+std::vector<float> placeholderWaveform(double durationSeconds) {
+    std::vector<float> waveform(kWaveformBins, 0.0F);
+    if (waveform.empty()) {
         return waveform;
     }
 
-    const std::size_t totalFrames = samples.size() / static_cast<std::size_t>(channels);
-    const std::size_t framesPerBin = std::max<std::size_t>(1, totalFrames / waveform.size());
-
+    const float seed = static_cast<float>(std::fmod(std::max(1.0, durationSeconds), 17.0) / 17.0);
     for (std::size_t bin = 0; bin < waveform.size(); ++bin) {
-        const std::size_t begin = bin * framesPerBin;
-        const std::size_t end = std::min(totalFrames, begin + framesPerBin);
-
-        float peak = 0.0f;
-        for (std::size_t frame = begin; frame < end; ++frame) {
-            for (int channel = 0; channel < channels; ++channel) {
-                const auto sampleIndex = frame * static_cast<std::size_t>(channels) + static_cast<std::size_t>(channel);
-                peak = std::max(peak, std::abs(static_cast<float>(samples[sampleIndex]) / kInt16Scale));
-            }
-        }
-
-        waveform[bin] = peak;
+        const float position = static_cast<float>(bin) / static_cast<float>(waveform.size() - 1);
+        const float envelope = 0.18F + 0.1F * std::sin((position * 7.0F + seed) * 3.1415926F);
+        waveform[bin] = std::clamp(envelope, 0.06F, 0.3F);
     }
 
     return waveform;
+}
+
+double inferDurationSeconds(const AVFormatContext* formatContext, const AVStream* stream) {
+    if (formatContext != nullptr && formatContext->duration > 0) {
+        return static_cast<double>(formatContext->duration) / static_cast<double>(AV_TIME_BASE);
+    }
+
+    if (stream != nullptr && stream->duration > 0) {
+        return static_cast<double>(stream->duration) * av_q2d(stream->time_base);
+    }
+
+    return 0.0;
 }
 
 std::string metadataValue(AVDictionary* metadata, const char* key) {
@@ -217,79 +212,26 @@ std::shared_ptr<const AlbumArt> extractAlbumArt(AVFormatContext* formatContext, 
     return nullptr;
 }
 
-void decodeFrames(AVCodecContext* codecContext,
-                  AVFormatContext* formatContext,
-                  int audioStreamIndex,
-                  SwrContext* resampler,
-                  std::vector<std::int16_t>& samples) {
-    PacketPtr packet(av_packet_alloc());
-    FramePtr frame(av_frame_alloc());
+TrackMetadata scanTrackMetadata(AVFormatContext* formatContext,
+                               const AVStream* audioStream,
+                               const std::filesystem::path& path) {
+    TrackMetadata metadata;
+    metadata.path = path;
+    metadata.title = path.stem().string();
+    metadata.artist = metadataValue(formatContext->metadata, "artist");
+    metadata.album = metadataValue(formatContext->metadata, "album");
 
-    if (!packet || !frame) {
-        throw std::runtime_error("Failed to allocate FFmpeg packet/frame.");
+    const std::string title = metadataValue(formatContext->metadata, "title");
+    if (!title.empty()) {
+        metadata.title = title;
     }
 
-    auto appendFrame = [&](AVFrame* decodedFrame) {
-        const int dstSamples = av_rescale_rnd(
-            swr_get_delay(resampler, codecContext->sample_rate) + decodedFrame->nb_samples,
-            kOutputSampleRate,
-            codecContext->sample_rate,
-            AV_ROUND_UP);
-
-        std::vector<std::int16_t> converted(static_cast<std::size_t>(dstSamples) * kOutputChannels);
-        uint8_t* outPlanes[] = {reinterpret_cast<uint8_t*>(converted.data())};
-        const auto* inPlanes = const_cast<const uint8_t**>(decodedFrame->extended_data);
-
-        const int written = swr_convert(resampler, outPlanes, dstSamples, inPlanes, decodedFrame->nb_samples);
-        if (written < 0) {
-            throw std::runtime_error("Audio resampling failed: " + ffmpegError(written));
-        }
-
-        converted.resize(static_cast<std::size_t>(written) * kOutputChannels);
-        samples.insert(samples.end(), converted.begin(), converted.end());
-    };
-
-    auto receiveFrames = [&]() {
-        while (true) {
-            const int receiveResult = avcodec_receive_frame(codecContext, frame.get());
-            if (receiveResult == AVERROR(EAGAIN) || receiveResult == AVERROR_EOF) {
-                return;
-            }
-            if (receiveResult < 0) {
-                throw std::runtime_error("Decoder receive error: " + ffmpegError(receiveResult));
-            }
-
-            appendFrame(frame.get());
-            av_frame_unref(frame.get());
-        }
-    };
-
-    while (true) {
-        const int readResult = av_read_frame(formatContext, packet.get());
-        if (readResult == AVERROR_EOF) {
-            break;
-        }
-        if (readResult < 0) {
-            throw std::runtime_error("Failed to read audio packet: " + ffmpegError(readResult));
-        }
-
-        if (packet->stream_index == audioStreamIndex) {
-            const int sendResult = avcodec_send_packet(codecContext, packet.get());
-            if (sendResult < 0) {
-                throw std::runtime_error("Decoder send error: " + ffmpegError(sendResult));
-            }
-
-            receiveFrames();
-        }
-
-        av_packet_unref(packet.get());
-    }
-
-    const int flushResult = avcodec_send_packet(codecContext, nullptr);
-    if (flushResult < 0) {
-        throw std::runtime_error("Decoder flush error: " + ffmpegError(flushResult));
-    }
-    receiveFrames();
+    LyricsLoader lyricsLoader;
+    metadata.albumArt = extractAlbumArt(formatContext, path);
+    metadata.lyrics = std::make_shared<LyricsData>(lyricsLoader.loadForTrack(path));
+    metadata.durationSeconds = inferDurationSeconds(formatContext, audioStream);
+    metadata.waveform = placeholderWaveform(metadata.durationSeconds);
+    return metadata;
 }
 
 }  // namespace
@@ -315,83 +257,8 @@ DecodedTrack AudioDecoder::decode(const std::filesystem::path& path) const {
     }
 
     AVStream* stream = formatContext->streams[audioStreamIndex];
-    const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
-    if (codec == nullptr) {
-        throw std::runtime_error("Unsupported codec for " + path.filename().string());
-    }
-
-    CodecContextPtr codecContext(avcodec_alloc_context3(codec));
-    if (!codecContext) {
-        throw std::runtime_error("Cannot allocate decoder context.");
-    }
-
-    const int parameterResult = avcodec_parameters_to_context(codecContext.get(), stream->codecpar);
-    if (parameterResult < 0) {
-        throw std::runtime_error("Cannot copy codec parameters: " + ffmpegError(parameterResult));
-    }
-
-    const int codecOpenResult = avcodec_open2(codecContext.get(), codec, nullptr);
-    if (codecOpenResult < 0) {
-        throw std::runtime_error("Cannot open decoder: " + ffmpegError(codecOpenResult));
-    }
-
-    AVChannelLayout outLayout;
-    av_channel_layout_default(&outLayout, kOutputChannels);
-
-    AVChannelLayout inLayout = codecContext->ch_layout;
-    if (inLayout.nb_channels == 0) {
-        av_channel_layout_default(&inLayout, 2);
-    }
-
-    SwrContext* rawResampler = nullptr;
-    const int swrSetupResult = swr_alloc_set_opts2(
-        &rawResampler,
-        &outLayout,
-        AV_SAMPLE_FMT_S16,
-        kOutputSampleRate,
-        &inLayout,
-        codecContext->sample_fmt,
-        codecContext->sample_rate,
-        0,
-        nullptr);
-
-    if (swrSetupResult < 0 || rawResampler == nullptr) {
-        av_channel_layout_uninit(&outLayout);
-        throw std::runtime_error("Cannot configure resampler: " + ffmpegError(swrSetupResult));
-    }
-
-    SwrContextPtr resampler(rawResampler);
-
-    const int swrInitResult = swr_init(resampler.get());
-    if (swrInitResult < 0) {
-        av_channel_layout_uninit(&outLayout);
-        throw std::runtime_error("Cannot initialize resampler: " + ffmpegError(swrInitResult));
-    }
-
     DecodedTrack track;
-    track.path = path;
-    track.title = path.stem().string();
-    track.sampleRate = kOutputSampleRate;
-    track.channels = kOutputChannels;
-    track.artist = metadataValue(formatContext->metadata, "artist");
-    track.album = metadataValue(formatContext->metadata, "album");
-
-    const std::string title = metadataValue(formatContext->metadata, "title");
-    if (!title.empty()) {
-        track.title = title;
-    }
-
-    LyricsLoader lyricsLoader;
-    track.albumArt = extractAlbumArt(formatContext.get(), path);
-    track.lyrics = std::make_shared<LyricsData>(lyricsLoader.loadForTrack(path));
-
-    decodeFrames(codecContext.get(), formatContext.get(), audioStreamIndex, resampler.get(), track.samples);
-
-    track.durationSeconds =
-        static_cast<double>(track.samples.size()) / static_cast<double>(track.sampleRate * track.channels);
-    track.waveform = buildWaveform(track.samples, track.channels);
-
-    av_channel_layout_uninit(&outLayout);
+    track.metadata = scanTrackMetadata(formatContext.get(), stream, path);
     return track;
 }
 

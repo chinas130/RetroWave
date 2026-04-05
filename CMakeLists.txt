@@ -14,6 +14,9 @@ add_executable(retrowave
     src/main.cpp
     src/audio/AudioDecoder.cpp
     src/audio/AudioOutput.cpp
+    src/audio/AudioRingBuffer.cpp
+    src/audio/AudioStreamDecoder.cpp
+    src/audio/WaveformCache.cpp
     src/audio/PlaybackEngine.cpp
     src/core/Lyrics.cpp
     src/core/Playlist.cpp

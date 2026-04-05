@@ -42,17 +42,6 @@ std::string formatTime(double seconds) {
     return stream.str();
 }
 
-std::string makeBar(double ratio, int width, char fill = '#', char empty = '-') {
-    ratio = std::clamp(ratio, 0.0, 1.0);
-    const int filled = static_cast<int>(std::round(ratio * width));
-
-    std::string bar(static_cast<std::size_t>(width), empty);
-    for (int index = 0; index < filled && index < width; ++index) {
-        bar[static_cast<std::size_t>(index)] = fill;
-    }
-    return bar;
-}
-
 std::vector<std::string> wrapText(const std::string& text, int width) {
     std::vector<std::string> lines;
     if (width <= 0) {
@@ -249,8 +238,6 @@ int TerminalUI::run() {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
-    timeout(80);
-
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -264,37 +251,31 @@ int TerminalUI::run() {
 
     while (running_) {
         engine_.update();
-        const PlaybackSnapshot snapshot = engine_.snapshot();
+        PlaybackSnapshot snapshot = engine_.snapshot();
         syncErrorOverlay(snapshot);
 
+        const auto beforeInput = std::chrono::steady_clock::now();
+        timeout(computePollTimeout(snapshot, beforeInput));
         const int key = getch();
         if (key != ERR) {
             handleInput(key);
         }
 
-        draw(snapshot);
+        engine_.update();
+        snapshot = engine_.snapshot();
+        syncErrorOverlay(snapshot);
+        draw(snapshot, std::chrono::steady_clock::now());
     }
 
     endwin();
     return 0;
 }
 
-void TerminalUI::draw(const PlaybackSnapshot& snapshot) const {
-    erase();
-
-    int rows = 0;
-    int cols = 0;
-    getmaxyx(stdscr, rows, cols);
-
-    const int minWidth = 96;
-    const int minHeight = 24;
-    if (rows < minHeight || cols < minWidth) {
-        mvprintw(1, 2, "RetroWave needs at least %dx%d terminal size.", minWidth, minHeight);
-        mvprintw(3, 2, "Current size: %dx%d", cols, rows);
-        mvprintw(5, 2, "Resize the terminal to continue.");
-        refresh();
-        return;
-    }
+TerminalUI::Layout TerminalUI::computeLayout(int rows, int cols) const {
+    Layout layout;
+    layout.rows = rows;
+    layout.cols = cols;
+    layout.header = {0, 0, 1, cols};
 
     const int playlistWidth = std::max(32, cols / 3);
     const int rightWidth = cols - playlistWidth - 3;
@@ -302,33 +283,253 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot) const {
     const int detailHeight = std::max(9, contentHeight / 2);
     const int cardHeight = contentHeight - detailHeight;
 
+    layout.playlistFrame = {1, 1, contentHeight, playlistWidth};
+    layout.playlistContent = {2, 2, contentHeight - 2, playlistWidth - 2};
+    layout.albumFrame = {1, playlistWidth + 2, cardHeight, rightWidth};
+
+    const int albumTop = 2;
+    const int albumLeft = playlistWidth + 3;
+    const int albumHeight = cardHeight - 2;
+    const int albumWidth = rightWidth - 2;
+    const int artWidth = std::clamp(albumWidth / 3, 18, 28);
+    const int infoLeft = albumLeft + artWidth + 2;
+    const int infoWidth = std::max(12, albumWidth - artWidth - 2);
+    const int timeHeight = albumHeight >= 6 ? 2 : 1;
+    const int gapHeight = albumHeight >= 8 ? 1 : 0;
+    const int metaHeight = std::max(1, albumHeight - timeHeight - gapHeight);
+
+    layout.cover = {albumTop, albumLeft, albumHeight, artWidth};
+    layout.meta = {albumTop, infoLeft, metaHeight, infoWidth};
+    layout.time = {albumTop + metaHeight + gapHeight, infoLeft, timeHeight, infoWidth};
+
+    layout.detailFrame = {1 + cardHeight, playlistWidth + 2, detailHeight, rightWidth};
+    layout.detailContent = {2 + cardHeight, playlistWidth + 3, detailHeight - 2, rightWidth - 2};
+    return layout;
+}
+
+int TerminalUI::computePollTimeout(
+    const PlaybackSnapshot& snapshot,
+    std::chrono::steady_clock::time_point now) const {
+    using namespace std::chrono;
+
+    if (!activeError_.empty() || !modalBody_.empty()) {
+        return 180;
+    }
+
+    if (!snapshot.hasTrack || snapshot.paused || snapshot.loading) {
+        return 180;
+    }
+
+    if (detailMode_ == DetailMode::Visualizer) {
+        constexpr auto kVisualizerInterval = milliseconds(80);
+        if (lastVisualizerRedraw_.time_since_epoch().count() == 0) {
+            return 0;
+        }
+
+        const auto nextTick = lastVisualizerRedraw_ + kVisualizerInterval;
+        if (nextTick <= now) {
+            return 0;
+        }
+        return static_cast<int>(duration_cast<milliseconds>(nextTick - now).count());
+    }
+
+    return 140;
+}
+
+void TerminalUI::clearRect(const Rect& rect) const {
+    for (int row = 0; row < rect.height; ++row) {
+        mvprintw(rect.top + row, rect.left, "%-*s", rect.width, "");
+    }
+}
+
+void TerminalUI::drawHeader(const Rect& rect) const {
+    mvprintw(rect.top, rect.left, "%-*s", rect.width, "");
     attron(COLOR_PAIR(1) | A_BOLD);
-    mvprintw(0, 2, "RetroWave");
+    mvprintw(rect.top, rect.left + 2, "RetroWave");
     attroff(COLOR_PAIR(1) | A_BOLD);
-    mvprintw(0, 14, "Terminal player with ASCII album art and .lrc lyrics");
+    mvprintw(rect.top, rect.left + 14, "Terminal player with ASCII album art and .lrc lyrics");
+}
 
-    drawFrame(1, 1, contentHeight, playlistWidth, "Playlist");
-    drawFrame(1, playlistWidth + 2, cardHeight, rightWidth, "Album Card");
+void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_clock::time_point now) {
+    int rows = 0;
+    int cols = 0;
+    getmaxyx(stdscr, rows, cols);
 
-    const char* detailTitle = detailMode_ == DetailMode::Lyrics ? "Lyrics" : "Visualizer";
-    drawFrame(1 + cardHeight, playlistWidth + 2, detailHeight, rightWidth, detailTitle);
+    const int minWidth = 96;
+    const int minHeight = 24;
+    if (rows < minHeight || cols < minWidth) {
+        erase();
+        mvprintw(1, 2, "RetroWave needs at least %dx%d terminal size.", minWidth, minHeight);
+        mvprintw(3, 2, "Current size: %dx%d", cols, rows);
+        mvprintw(5, 2, "Resize the terminal to continue.");
+        wnoutrefresh(stdscr);
+        doupdate();
+        layoutValid_ = false;
+        needsFullRedraw_ = true;
+        overlayVisibleLastFrame_ = false;
+        return;
+    }
 
-    drawPlaylist(2, 2, contentHeight - 2, playlistWidth - 2, snapshot);
-    drawAlbumCard(2, playlistWidth + 3, cardHeight - 2, rightWidth - 2, snapshot);
+    const bool overlayVisible = !activeError_.empty() || !modalBody_.empty();
+    if (!overlayVisible && overlayVisibleLastFrame_) {
+        needsFullRedraw_ = true;
+    }
+    overlayVisibleLastFrame_ = overlayVisible;
 
-    if (detailMode_ == DetailMode::Lyrics) {
-        drawLyrics(2 + cardHeight, playlistWidth + 3, detailHeight - 2, rightWidth - 2, snapshot);
+    if (overlayVisible) {
+        erase();
+        if (!activeError_.empty()) {
+            drawModalOverlay(rows, cols, "Error", "Playback backend or decode failure", activeError_);
+        } else {
+            drawLegalScreen(rows, cols);
+        }
+        wnoutrefresh(stdscr);
+        doupdate();
+        return;
+    }
+
+    const Layout nextLayout = computeLayout(rows, cols);
+    if (!layoutValid_ ||
+        nextLayout.rows != layout_.rows ||
+        nextLayout.cols != layout_.cols ||
+        nextLayout.playlistFrame.width != layout_.playlistFrame.width ||
+        nextLayout.albumFrame.height != layout_.albumFrame.height ||
+        nextLayout.detailFrame.height != layout_.detailFrame.height) {
+        layout_ = nextLayout;
+        layoutValid_ = true;
+        needsFullRedraw_ = true;
+        visualizerState_.clear();
     } else {
-        drawVisualizer(2 + cardHeight, playlistWidth + 3, detailHeight - 2, rightWidth - 2, snapshot);
+        layout_ = nextLayout;
+    }
+
+    const bool fullRedraw = needsFullRedraw_;
+    const bool playlistDirty =
+        fullRedraw || selectedIndex_ != lastSelectedIndex_ || snapshot.currentIndex != lastCurrentIndex_ ||
+        snapshot.hasTrack != lastHasTrack_;
+    const bool coverDirty = fullRedraw || snapshot.path != lastTrackPath_;
+    const bool metaDirty =
+        fullRedraw || snapshot.path != lastTrackPath_ || snapshot.title != lastTitle_ || snapshot.artist != lastArtist_ ||
+        snapshot.album != lastAlbum_ || snapshot.paused != lastPaused_ || snapshot.loading != lastLoading_ ||
+        (snapshot.lyrics && snapshot.lyrics->found) != lastLyricsFound_ ||
+        static_cast<int>(std::round(snapshot.volume * 100.0F)) != lastVolumePercent_;
+    const bool timeDirty =
+        fullRedraw || snapshot.path != lastTrackPath_ ||
+        static_cast<int>(std::round(snapshot.positionSeconds)) != lastPositionSecond_;
+    const bool detailFrameDirty = fullRedraw || detailMode_ != lastDetailMode_;
+
+    bool detailDirty = fullRedraw || detailMode_ != lastDetailMode_;
+    if (detailMode_ == DetailMode::Visualizer) {
+        const bool due = fullRedraw || snapshot.path != lastTrackPath_ ||
+            lastVisualizerRedraw_.time_since_epoch().count() == 0 ||
+            now - lastVisualizerRedraw_ >= std::chrono::milliseconds(80);
+        detailDirty = detailDirty || due;
+        if (detailDirty) {
+            lastVisualizerRedraw_ = now;
+        }
+    } else {
+        const int activeLyricIndex =
+            snapshot.lyrics ? currentLyricIndex(*snapshot.lyrics, snapshot.positionSeconds) : -1;
+        detailDirty = detailDirty || snapshot.path != lastTrackPath_ || activeLyricIndex != lastActiveLyricIndex_;
+        lastActiveLyricIndex_ = activeLyricIndex;
+    }
+
+    if (fullRedraw) {
+        erase();
+        drawHeader(layout_.header);
+        drawFrame(
+            layout_.playlistFrame.top,
+            layout_.playlistFrame.left,
+            layout_.playlistFrame.height,
+            layout_.playlistFrame.width,
+            "Playlist");
+        drawFrame(
+            layout_.albumFrame.top,
+            layout_.albumFrame.left,
+            layout_.albumFrame.height,
+            layout_.albumFrame.width,
+            "Album Card");
+        drawFrame(
+            layout_.detailFrame.top,
+            layout_.detailFrame.left,
+            layout_.detailFrame.height,
+            layout_.detailFrame.width,
+            detailMode_ == DetailMode::Lyrics ? "Lyrics" : "Visualizer");
+    } else if (detailFrameDirty) {
+        clearRect(layout_.detailFrame);
+        drawFrame(
+            layout_.detailFrame.top,
+            layout_.detailFrame.left,
+            layout_.detailFrame.height,
+            layout_.detailFrame.width,
+            detailMode_ == DetailMode::Lyrics ? "Lyrics" : "Visualizer");
+    }
+
+    if (playlistDirty) {
+        clearRect(layout_.playlistContent);
+        drawPlaylist(
+            layout_.playlistContent.top,
+            layout_.playlistContent.left,
+            layout_.playlistContent.height,
+            layout_.playlistContent.width,
+            snapshot);
+    }
+
+    if (coverDirty) {
+        clearRect(layout_.cover);
+        drawCoverPane(layout_.cover.top, layout_.cover.left, layout_.cover.height, layout_.cover.width, snapshot);
+    }
+
+    if (metaDirty) {
+        clearRect(layout_.meta);
+        drawMetaPane(layout_.meta.top, layout_.meta.left, layout_.meta.height, layout_.meta.width, snapshot);
+    }
+
+    if (timeDirty) {
+        clearRect(layout_.time);
+        drawTimePane(layout_.time.top, layout_.time.left, layout_.time.height, layout_.time.width, snapshot);
+    }
+
+    if (detailDirty) {
+        clearRect(layout_.detailContent);
+        if (detailMode_ == DetailMode::Lyrics) {
+            drawLyrics(
+                layout_.detailContent.top,
+                layout_.detailContent.left,
+                layout_.detailContent.height,
+                layout_.detailContent.width,
+                snapshot);
+        } else {
+            drawVisualizer(
+                layout_.detailContent.top,
+                layout_.detailContent.left,
+                layout_.detailContent.height,
+                layout_.detailContent.width,
+                snapshot);
+        }
     }
 
     if (!activeError_.empty()) {
         drawModalOverlay(rows, cols, "Error", "Playback backend or decode failure", activeError_);
-    } else if (!modalBody_.empty()) {
-        drawLegalScreen(rows, cols);
     }
 
-    refresh();
+    wnoutrefresh(stdscr);
+    doupdate();
+
+    needsFullRedraw_ = false;
+    lastSelectedIndex_ = selectedIndex_;
+    lastCurrentIndex_ = snapshot.currentIndex;
+    lastTrackPath_ = snapshot.path;
+    lastTitle_ = snapshot.title;
+    lastArtist_ = snapshot.artist;
+    lastAlbum_ = snapshot.album;
+    lastHasTrack_ = snapshot.hasTrack;
+    lastPaused_ = snapshot.paused;
+    lastLoading_ = snapshot.loading;
+    lastLyricsFound_ = snapshot.lyrics && snapshot.lyrics->found;
+    lastVolumePercent_ = static_cast<int>(std::round(snapshot.volume * 100.0F));
+    lastPositionSecond_ = static_cast<int>(std::round(snapshot.positionSeconds));
+    lastDetailMode_ = detailMode_;
 }
 
 void TerminalUI::drawFrame(int top, int left, int height, int width, const char* title) const {
@@ -347,8 +548,8 @@ void TerminalUI::drawFrame(int top, int left, int height, int width, const char*
 }
 
 void TerminalUI::drawPlaylist(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
-    const auto& items = engine_.playlist().items();
-    if (items.empty()) {
+    const auto& playlist = engine_.playlist();
+    if (playlist.empty()) {
         mvprintw(top, left, "No tracks.");
         return;
     }
@@ -361,14 +562,14 @@ void TerminalUI::drawPlaylist(int top, int left, int height, int width, const Pl
 
     for (int row = 0; row < visibleRows; ++row) {
         const std::size_t index = static_cast<std::size_t>(firstVisible + row);
-        if (index >= items.size()) {
+        if (index >= playlist.size()) {
             break;
         }
 
         const bool isSelected = index == selectedIndex_;
         const bool isCurrent = snapshot.hasTrack && index == snapshot.currentIndex;
         const std::string prefix = isCurrent ? "> " : "  ";
-        const std::string line = prefix + trimText(items[index].title, width - 4);
+        const std::string line = prefix + trimText(playlist.titleAt(index), width - 4);
 
         if (isSelected) {
             attron(A_REVERSE);
@@ -397,16 +598,27 @@ void TerminalUI::drawAlbumCard(int top, int left, int height, int width, const P
     const int artWidth = std::clamp(width / 3, 18, 28);
     const int infoLeft = left + artWidth + 2;
     const int infoWidth = std::max(12, width - artWidth - 2);
-    const auto artLines = renderAsciiArt(snapshot.albumArt, artWidth, height);
+    const int timeHeight = height >= 6 ? 2 : 1;
+    const int gapHeight = height >= 8 ? 1 : 0;
+    const int metaHeight = std::max(1, height - timeHeight - gapHeight);
+    const int timeTop = top + metaHeight + gapHeight;
+
+    drawCoverPane(top, left, height, artWidth, snapshot);
+    drawMetaPane(top, infoLeft, metaHeight, infoWidth, snapshot);
+    drawTimePane(timeTop, infoLeft, timeHeight, infoWidth, snapshot);
+}
+
+void TerminalUI::drawCoverPane(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
+    const auto artLines = renderAsciiArt(snapshot.albumArt, width, height);
     const int artTop = top + std::max(0, (height - static_cast<int>(artLines.size())) / 2);
 
     for (int row = 0; row < height; ++row) {
-        mvprintw(top + row, left, "%-*s", artWidth, "");
+        mvprintw(top + row, left, "%-*s", width, "");
     }
 
     for (int row = 0; row < std::min(height, static_cast<int>(artLines.size())); ++row) {
         const auto& line = artLines[static_cast<std::size_t>(row)];
-        const int artLeft = left + std::max(0, (artWidth - static_cast<int>(line.size())) / 2);
+        const int artLeft = left + std::max(0, (width - static_cast<int>(line.size())) / 2);
         if (has_colors()) {
             attron(COLOR_PAIR(4));
         }
@@ -415,29 +627,82 @@ void TerminalUI::drawAlbumCard(int top, int left, int height, int width, const P
             attroff(COLOR_PAIR(4));
         }
     }
+}
 
-    attron(A_BOLD);
-    mvprintw(top, infoLeft, "%s", trimText(snapshot.title, infoWidth).c_str());
-    attroff(A_BOLD);
-
-    mvprintw(top + 2, infoLeft, "Artist : %s", trimText(snapshot.artist.empty() ? "Unknown" : snapshot.artist, infoWidth - 9).c_str());
-    mvprintw(top + 3, infoLeft, "Album  : %s", trimText(snapshot.album.empty() ? "Unknown" : snapshot.album, infoWidth - 9).c_str());
+void TerminalUI::drawMetaPane(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
+    if (height <= 0 || width <= 0) {
+        return;
+    }
 
     const std::string state = snapshot.loading ? "loading" : (snapshot.paused ? "paused" : "playing");
-    mvprintw(top + 5, infoLeft, "State  : %s", state.c_str());
-    mvprintw(
-        top + 6,
-        infoLeft,
-        "Time   : %s / %s",
-        formatTime(snapshot.positionSeconds).c_str(),
-        formatTime(snapshot.durationSeconds).c_str());
-    mvprintw(top + 7, infoLeft, "Volume : %3d%%", static_cast<int>(std::round(snapshot.volume * 100.0F)));
-    mvprintw(top + 8, infoLeft, "Level  : [%s]", makeBar(snapshot.level, std::max(8, infoWidth - 11), '=', '.').c_str());
+    const std::string lyricsStatus = snapshot.lyrics && snapshot.lyrics->found ? "loaded" : "missing";
 
-    const std::string lyricsStatus =
-        snapshot.lyrics && snapshot.lyrics->found ? "loaded" : "missing";
-    mvprintw(top + 10, infoLeft, "Lyrics : %s", lyricsStatus.c_str());
-    mvprintw(top + 11, infoLeft, "Source : %s", trimText(snapshot.path, infoWidth - 9).c_str());
+    std::vector<std::string> lines;
+    lines.reserve(7);
+    lines.push_back(trimText(snapshot.title, width));
+    lines.push_back({});
+    lines.push_back("Artist : " + trimText(snapshot.artist.empty() ? "Unknown" : snapshot.artist, std::max(0, width - 9)));
+    lines.push_back("Album  : " + trimText(snapshot.album.empty() ? "Unknown" : snapshot.album, std::max(0, width - 9)));
+    lines.push_back("State  : " + trimText(state, std::max(0, width - 9)));
+    lines.push_back("Volume : " + std::to_string(static_cast<int>(std::round(snapshot.volume * 100.0F))) + "%");
+    lines.push_back("Lyrics : " + lyricsStatus);
+
+    for (int row = 0; row < height; ++row) {
+        mvprintw(top + row, left, "%-*s", width, "");
+    }
+
+    for (int row = 0; row < std::min(height, static_cast<int>(lines.size())); ++row) {
+        if (row == 0) {
+            attron(A_BOLD);
+        }
+        mvprintw(top + row, left, "%-*s", width, trimText(lines[static_cast<std::size_t>(row)], width).c_str());
+        if (row == 0) {
+            attroff(A_BOLD);
+        }
+    }
+
+    if (height >= 2) {
+        mvprintw(
+            top + height - 1,
+            left,
+            "%-*s",
+            width,
+            trimText("Source : " + snapshot.path, width).c_str());
+    }
+}
+
+void TerminalUI::drawTimePane(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
+    if (height <= 0 || width <= 0) {
+        return;
+    }
+
+    for (int row = 0; row < height; ++row) {
+        mvprintw(top + row, left, "%-*s", width, "");
+    }
+
+    if (height >= 2) {
+        attron(A_DIM);
+        mvprintw(top, left, "%-*s", width, "Time");
+        attroff(A_DIM);
+        attron(A_BOLD);
+        mvprintw(
+            top + 1,
+            left,
+            "%-*s",
+            width,
+            trimText(formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds), width).c_str());
+        attroff(A_BOLD);
+        return;
+    }
+
+    attron(A_BOLD);
+    mvprintw(
+        top,
+        left,
+        "%-*s",
+        width,
+        trimText("Time : " + formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds), width).c_str());
+    attroff(A_BOLD);
 }
 
 void TerminalUI::drawVisualizer(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
