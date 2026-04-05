@@ -325,7 +325,7 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot) const {
     if (!activeError_.empty()) {
         drawModalOverlay(rows, cols, "Error", "Playback backend or decode failure", activeError_);
     } else if (!modalBody_.empty()) {
-        drawModalOverlay(rows, cols, modalTitle_, modalSubtitle_, modalBody_);
+        drawLegalScreen(rows, cols);
     }
 
     refresh();
@@ -638,6 +638,71 @@ void TerminalUI::drawModalOverlay(
 
     wrefresh(overlay);
     delwin(overlay);
+}
+
+void TerminalUI::drawLegalScreen(int rows, int cols) const {
+    erase();
+
+    const int inset = 2;
+    const int boxTop = inset;
+    const int boxLeft = inset;
+    const int boxHeight = std::max(8, rows - inset * 2);
+    const int boxWidth = std::max(20, cols - inset * 2);
+    const int bodyWidth = std::max(20, boxWidth - 6);
+    const auto wrappedBody = wrapText(modalBody_, bodyWidth);
+    const int maxBodyLines = std::max(1, boxHeight - 8);
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(1) | A_BOLD);
+    } else {
+        attron(A_BOLD);
+    }
+    mvprintw(0, 2, "RetroWave");
+    if (has_colors()) {
+        attroff(COLOR_PAIR(1) | A_BOLD);
+    } else {
+        attroff(A_BOLD);
+    }
+    mvprintw(0, 14, "Legal Notice");
+
+    drawFrame(boxTop, boxLeft, boxHeight, boxWidth, modalTitle_.c_str());
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(3) | A_BOLD);
+    } else {
+        attron(A_BOLD);
+    }
+    mvprintw(boxTop + 2, boxLeft + 3, "%s", trimText(modalSubtitle_, bodyWidth).c_str());
+    if (has_colors()) {
+        attroff(COLOR_PAIR(3) | A_BOLD);
+    } else {
+        attroff(A_BOLD);
+    }
+
+    for (int index = 0; index < std::min<int>(wrappedBody.size(), maxBodyLines); ++index) {
+        mvprintw(
+            boxTop + 4 + index,
+            boxLeft + 3,
+            "%-*s",
+            bodyWidth,
+            wrappedBody[static_cast<std::size_t>(index)].c_str());
+    }
+
+    if (static_cast<int>(wrappedBody.size()) > maxBodyLines) {
+        mvprintw(boxTop + 4 + maxBodyLines - 1, boxLeft + boxWidth - 6, "%s", "...");
+    }
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(6) | A_BOLD);
+    } else {
+        attron(A_BOLD);
+    }
+    mvprintw(boxTop + boxHeight - 3, boxLeft + 3, "%s", "Enter/Esc dismiss   q quit");
+    if (has_colors()) {
+        attroff(COLOR_PAIR(6) | A_BOLD);
+    } else {
+        attroff(A_BOLD);
+    }
 }
 
 void TerminalUI::handleInput(int key) {

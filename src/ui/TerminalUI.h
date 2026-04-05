@@ -25,6 +25,7 @@ class TerminalUI {
     void drawVisualizer(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
     void drawLyrics(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
     void drawModalOverlay(int rows, int cols, const std::string& title, const std::string& subtitle, const std::string& body) const;
+    void drawLegalScreen(int rows, int cols) const;
     void handleInput(int key);
     void syncErrorOverlay(const PlaybackSnapshot& snapshot);
     void openWarrantyOverlay();
