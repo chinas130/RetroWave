@@ -198,7 +198,7 @@ bool AudioStreamDecoder::decodeNextChunk() {
 
             pendingSamples_.assign(static_cast<std::size_t>(dstSamples) * kOutputChannels, 0);
             uint8_t* outPlanes[] = {reinterpret_cast<uint8_t*>(pendingSamples_.data())};
-            const auto* inPlanes = const_cast<const uint8_t**>(frame_->extended_data);
+            const uint8_t** inPlanes = const_cast<const uint8_t**>(frame_->extended_data);
 
             const int written = swr_convert(resampler_, outPlanes, dstSamples, inPlanes, frame_->nb_samples);
             av_frame_unref(frame_);
