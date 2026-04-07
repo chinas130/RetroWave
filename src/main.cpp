@@ -6,6 +6,7 @@ extern "C" {
 #include <libavutil/log.h>
 }
 
+#include <clocale>
 #include <exception>
 #include <iostream>
 #include <string>
@@ -13,6 +14,7 @@ extern "C" {
 
 int main(int argc, char** argv) {
     try {
+        std::setlocale(LC_ALL, "");
         av_log_set_level(AV_LOG_QUIET);
 
         std::vector<std::string> sources;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwchar>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -12,20 +13,85 @@
 namespace retrowave {
 namespace {
 
+std::size_t nextGlyphBytes(const std::string& value, std::size_t offset, int& columns) {
+    if (offset >= value.size()) {
+        columns = 0;
+        return 0;
+    }
+
+    mbstate_t state{};
+    wchar_t wide = 0;
+    const char* current = value.data() + static_cast<std::ptrdiff_t>(offset);
+    const std::size_t remaining = value.size() - offset;
+    const std::size_t length = std::mbrtowc(&wide, current, remaining, &state);
+
+    if (length == static_cast<std::size_t>(-1) || length == static_cast<std::size_t>(-2)) {
+        columns = 1;
+        return 1;
+    }
+
+    if (length == 0) {
+        columns = 0;
+        return 1;
+    }
+
+    const int width = wcwidth(wide);
+    columns = width < 0 ? 1 : width;
+    return length;
+}
+
+int displayWidth(const std::string& value) {
+    int total = 0;
+    for (std::size_t offset = 0; offset < value.size();) {
+        int columns = 0;
+        const auto length = nextGlyphBytes(value, offset, columns);
+        if (length == 0) {
+            break;
+        }
+        total += columns;
+        offset += length;
+    }
+    return total;
+}
+
+std::string takeColumns(const std::string& value, int width) {
+    if (width <= 0) {
+        return {};
+    }
+
+    std::size_t endOffset = 0;
+    int consumed = 0;
+    for (std::size_t offset = 0; offset < value.size();) {
+        int columns = 0;
+        const auto length = nextGlyphBytes(value, offset, columns);
+        if (length == 0) {
+            break;
+        }
+        if (consumed + columns > width) {
+            break;
+        }
+        consumed += columns;
+        offset += length;
+        endOffset = offset;
+    }
+
+    return value.substr(0, endOffset);
+}
+
 std::string trimText(const std::string& value, int width) {
     if (width <= 0) {
         return {};
     }
 
-    if (static_cast<int>(value.size()) <= width) {
+    if (displayWidth(value) <= width) {
         return value;
     }
 
     if (width <= 3) {
-        return value.substr(0, static_cast<std::size_t>(width));
+        return takeColumns(value, width);
     }
 
-    return value.substr(0, static_cast<std::size_t>(width - 3)) + "...";
+    return takeColumns(value, width - 3) + "...";
 }
 
 std::string formatTime(double seconds) {
@@ -48,48 +114,35 @@ std::vector<std::string> wrapText(const std::string& text, int width) {
         return lines;
     }
 
-    std::istringstream words(text);
-    std::string word;
-    std::string currentLine;
-
-    auto flushLine = [&]() {
-        if (!currentLine.empty()) {
-            lines.push_back(currentLine);
-            currentLine.clear();
-        }
-    };
-
-    while (words >> word) {
-        while (static_cast<int>(word.size()) > width) {
-            if (!currentLine.empty()) {
-                flushLine();
-            }
-            lines.push_back(word.substr(0, static_cast<std::size_t>(width)));
-            word.erase(0, static_cast<std::size_t>(width));
-        }
-
-        if (currentLine.empty()) {
-            currentLine = word;
+    std::string remaining = text;
+    while (!remaining.empty()) {
+        const auto line = takeColumns(remaining, width);
+        if (line.empty()) {
+            lines.push_back(remaining.substr(0, 1));
+            remaining.erase(0, 1);
             continue;
         }
-
-        if (static_cast<int>(currentLine.size() + 1 + word.size()) <= width) {
-            currentLine += ' ';
-            currentLine += word;
-            continue;
-        }
-
-        flushLine();
-        currentLine = word;
+        lines.push_back(line);
+        remaining.erase(0, line.size());
     }
-
-    flushLine();
 
     if (lines.empty()) {
         lines.push_back({});
     }
 
     return lines;
+}
+
+void drawTextLine(int row, int column, int width, const std::string& text) {
+    if (width <= 0) {
+        return;
+    }
+
+    mvhline(row, column, ' ', width);
+    const auto clipped = trimText(text, width);
+    if (!clipped.empty()) {
+        mvaddnstr(row, column, clipped.c_str(), static_cast<int>(clipped.size()));
+    }
 }
 
 float sampleVisualizer(const std::vector<float>& bins, double position) {
@@ -338,12 +391,12 @@ int TerminalUI::computePollTimeout(
 
 void TerminalUI::clearRect(const Rect& rect) const {
     for (int row = 0; row < rect.height; ++row) {
-        mvprintw(rect.top + row, rect.left, "%-*s", rect.width, "");
+        mvhline(rect.top + row, rect.left, ' ', rect.width);
     }
 }
 
 void TerminalUI::drawHeader(const Rect& rect) const {
-    mvprintw(rect.top, rect.left, "%-*s", rect.width, "");
+    mvhline(rect.top, rect.left, ' ', rect.width);
     attron(COLOR_PAIR(1) | A_BOLD);
     mvprintw(rect.top, rect.left + 2, "RetroWave");
     attroff(COLOR_PAIR(1) | A_BOLD);
@@ -578,7 +631,7 @@ void TerminalUI::drawPlaylist(int top, int left, int height, int width, const Pl
             attron(COLOR_PAIR(2) | A_BOLD);
         }
 
-        mvprintw(top + row, left, "%-*s", width, line.c_str());
+        drawTextLine(top + row, left, width, line);
 
         if (isCurrent && has_colors()) {
             attroff(COLOR_PAIR(2) | A_BOLD);
@@ -613,7 +666,7 @@ void TerminalUI::drawCoverPane(int top, int left, int height, int width, const P
     const int artTop = top + std::max(0, (height - static_cast<int>(artLines.size())) / 2);
 
     for (int row = 0; row < height; ++row) {
-        mvprintw(top + row, left, "%-*s", width, "");
+        mvhline(top + row, left, ' ', width);
     }
 
     for (int row = 0; row < std::min(height, static_cast<int>(artLines.size())); ++row) {
@@ -648,26 +701,21 @@ void TerminalUI::drawMetaPane(int top, int left, int height, int width, const Pl
     lines.push_back("Lyrics : " + lyricsStatus);
 
     for (int row = 0; row < height; ++row) {
-        mvprintw(top + row, left, "%-*s", width, "");
+        mvhline(top + row, left, ' ', width);
     }
 
     for (int row = 0; row < std::min(height, static_cast<int>(lines.size())); ++row) {
         if (row == 0) {
             attron(A_BOLD);
         }
-        mvprintw(top + row, left, "%-*s", width, trimText(lines[static_cast<std::size_t>(row)], width).c_str());
+        drawTextLine(top + row, left, width, lines[static_cast<std::size_t>(row)]);
         if (row == 0) {
             attroff(A_BOLD);
         }
     }
 
     if (height >= 2) {
-        mvprintw(
-            top + height - 1,
-            left,
-            "%-*s",
-            width,
-            trimText("Source : " + snapshot.path, width).c_str());
+        drawTextLine(top + height - 1, left, width, "Source : " + snapshot.path);
     }
 }
 
@@ -677,31 +725,21 @@ void TerminalUI::drawTimePane(int top, int left, int height, int width, const Pl
     }
 
     for (int row = 0; row < height; ++row) {
-        mvprintw(top + row, left, "%-*s", width, "");
+        mvhline(top + row, left, ' ', width);
     }
 
     if (height >= 2) {
         attron(A_DIM);
-        mvprintw(top, left, "%-*s", width, "Time");
+        drawTextLine(top, left, width, "Time");
         attroff(A_DIM);
         attron(A_BOLD);
-        mvprintw(
-            top + 1,
-            left,
-            "%-*s",
-            width,
-            trimText(formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds), width).c_str());
+        drawTextLine(top + 1, left, width, formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds));
         attroff(A_BOLD);
         return;
     }
 
     attron(A_BOLD);
-    mvprintw(
-        top,
-        left,
-        "%-*s",
-        width,
-        trimText("Time : " + formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds), width).c_str());
+    drawTextLine(top, left, width, "Time : " + formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds));
     attroff(A_BOLD);
 }
 
@@ -772,12 +810,12 @@ void TerminalUI::drawVisualizer(int top, int left, int height, int width, const 
 void TerminalUI::drawLyrics(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
     if (!snapshot.lyrics || !snapshot.lyrics->found) {
         const std::string message = snapshot.lyrics ? snapshot.lyrics->message : "Could not find .lrc lyrics for this track.";
-        mvprintw(top + height / 2, left, "%s", trimText(message, width).c_str());
+        drawTextLine(top + height / 2, left, width, message);
         return;
     }
 
     if (snapshot.lyrics->lines.empty()) {
-        mvprintw(top + height / 2, left, "%s", trimText(snapshot.lyrics->message, width).c_str());
+        drawTextLine(top + height / 2, left, width, snapshot.lyrics->message);
         return;
     }
 
@@ -814,7 +852,7 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
             attron(A_DIM);
         }
 
-        mvprintw(top + row, left, "%-*s", width, rendered.c_str());
+        drawTextLine(top + row, left, width, rendered);
 
         if (isActive) {
             if (has_colors()) {
@@ -827,7 +865,7 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
         }
     }
 
-    mvprintw(top + height - 1, left, "%s", trimText(snapshot.lyrics->message, width).c_str());
+    drawTextLine(top + height - 1, left, width, snapshot.lyrics->message);
 }
 
 void TerminalUI::drawModalOverlay(
@@ -872,17 +910,17 @@ void TerminalUI::drawModalOverlay(
 
     wattron(overlay, A_BOLD);
     mvwprintw(overlay, 0, 2, " %s ", title.c_str());
-    mvwprintw(overlay, 1, 2, "%s", trimText(subtitle, overlayWidth - 4).c_str());
+    mvwaddnstr(overlay, 1, 2, trimText(subtitle, overlayWidth - 4).c_str(), -1);
     wattroff(overlay, A_BOLD);
 
     for (int index = 0; index < messageLines; ++index) {
-        mvwprintw(
+        mvwhline(overlay, 2 + index, 2, ' ', overlayWidth - 4);
+        mvwaddnstr(
             overlay,
             2 + index,
             2,
-            "%-*s",
-            overlayWidth - 4,
-            wrappedBody[static_cast<std::size_t>(index)].c_str());
+            trimText(wrappedBody[static_cast<std::size_t>(index)], overlayWidth - 4).c_str(),
+            -1);
     }
 
     if (static_cast<int>(wrappedBody.size()) > messageLines) {
@@ -894,7 +932,8 @@ void TerminalUI::drawModalOverlay(
     } else {
         wattron(overlay, A_BOLD);
     }
-    mvwprintw(overlay, overlayHeight - 2, 2, "%-*s", overlayWidth - 4, "Enter/Esc dismiss   q quit");
+    mvwhline(overlay, overlayHeight - 2, 2, ' ', overlayWidth - 4);
+    mvwaddnstr(overlay, overlayHeight - 2, 2, "Enter/Esc dismiss   q quit", -1);
     if (has_colors()) {
         wattroff(overlay, COLOR_PAIR(6) | A_BOLD);
     } else {
@@ -937,7 +976,7 @@ void TerminalUI::drawLegalScreen(int rows, int cols) const {
     } else {
         attron(A_BOLD);
     }
-    mvprintw(boxTop + 2, boxLeft + 3, "%s", trimText(modalSubtitle_, bodyWidth).c_str());
+    drawTextLine(boxTop + 2, boxLeft + 3, bodyWidth, modalSubtitle_);
     if (has_colors()) {
         attroff(COLOR_PAIR(3) | A_BOLD);
     } else {
@@ -945,12 +984,7 @@ void TerminalUI::drawLegalScreen(int rows, int cols) const {
     }
 
     for (int index = 0; index < std::min<int>(wrappedBody.size(), maxBodyLines); ++index) {
-        mvprintw(
-            boxTop + 4 + index,
-            boxLeft + 3,
-            "%-*s",
-            bodyWidth,
-            wrappedBody[static_cast<std::size_t>(index)].c_str());
+        drawTextLine(boxTop + 4 + index, boxLeft + 3, bodyWidth, wrappedBody[static_cast<std::size_t>(index)]);
     }
 
     if (static_cast<int>(wrappedBody.size()) > maxBodyLines) {
