@@ -1,11 +1,9 @@
 #pragma once
 
-#include <AudioToolbox/AudioQueue.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <vector>
+#include <memory>
 
 namespace retrowave {
 
@@ -23,18 +21,15 @@ class AudioOutput {
 
     AudioOutput(const AudioOutput&) = delete;
     AudioOutput& operator=(const AudioOutput&) = delete;
+    AudioOutput(AudioOutput&&) = delete;
+    AudioOutput& operator=(AudioOutput&&) = delete;
 
     void start();
     void stop();
 
   private:
-    static void handleBuffer(void* userData, AudioQueueRef queue, AudioQueueBufferRef buffer);
-    void fillAndEnqueue(AudioQueueBufferRef buffer);
-
-    RenderCallback render_;
-    AudioQueueRef queue_ = nullptr;
-    std::vector<AudioQueueBufferRef> buffers_;
-    bool started_ = false;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace retrowave

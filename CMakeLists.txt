@@ -10,10 +10,23 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswresample libswscale)
 pkg_check_modules(NCURSESW REQUIRED IMPORTED_TARGET ncursesw)
 
+set(AUDIO_OUTPUT_SOURCES)
+set(PLATFORM_LIBS)
+
+if(APPLE)
+    list(APPEND AUDIO_OUTPUT_SOURCES src/audio/AudioOutput_mac.cpp)
+    list(APPEND PLATFORM_LIBS "-framework AudioToolbox" "-framework CoreFoundation")
+elseif(UNIX AND NOT APPLE)
+    pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+    list(APPEND AUDIO_OUTPUT_SOURCES src/audio/AudioOutput_linux.cpp)
+    list(APPEND PLATFORM_LIBS PkgConfig::ALSA)
+else()
+    message(FATAL_ERROR "RetroWave currently supports audio output only on Apple and Linux.")
+endif()
+
 add_executable(retrowave
     src/main.cpp
     src/audio/AudioDecoder.cpp
-    src/audio/AudioOutput.cpp
     src/audio/AudioRingBuffer.cpp
     src/audio/AudioStreamDecoder.cpp
     src/audio/WaveformCache.cpp
@@ -21,6 +34,7 @@ add_executable(retrowave
     src/core/Lyrics.cpp
     src/core/Playlist.cpp
     src/ui/TerminalUI.cpp
+    ${AUDIO_OUTPUT_SOURCES}
 )
 
 target_include_directories(retrowave PRIVATE src)
@@ -29,8 +43,7 @@ target_link_libraries(retrowave
     PRIVATE
         PkgConfig::FFMPEG
         PkgConfig::NCURSESW
-        "-framework AudioToolbox"
-        "-framework CoreFoundation"
+        ${PLATFORM_LIBS}
 )
 
 target_compile_options(retrowave PRIVATE -Wall -Wextra -Wpedantic)
