@@ -17,6 +17,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     outputs:
       version: ${{ steps.meta.outputs.version }}
       source_sha256: ${{ steps.package.outputs.source_sha256 }}
@@ -66,15 +69,15 @@ jobs:
             dist/retrowave.rb
 
       - name: Update Homebrew tap
-        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' && secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_REPOSITORY != '' && env.HOMEBREW_TAP_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
-          repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ env.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
       - name: Publish formula into Homebrew tap
-        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' && secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_REPOSITORY != '' && env.HOMEBREW_TAP_TOKEN != '' }}
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |

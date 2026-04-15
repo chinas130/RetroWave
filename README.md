@@ -222,9 +222,9 @@ GitHub Actions now covers two paths:
   - emits a matching `sha256` file
   - renders a ready-to-publish `retrowave.rb` Homebrew formula
 
-## Homebrew Release Flow
+## Personal Homebrew Tap Flow
 
-The release workflow is designed around a personal tap.
+The release workflow can update a personal Homebrew tap. This is separate from publishing to the official `Homebrew/homebrew-core` repository.
 
 1. Create a tap repository such as `yourname/homebrew-retrowave`.
 2. Add a repository variable in the main repo:
@@ -252,6 +252,8 @@ Once the tap exists, installation looks like:
 brew tap yourname/retrowave
 brew install retrowave
 ```
+
+Publishing to `Homebrew/homebrew-core` is a separate future step and requires opening a PR against Homebrew's official formula repository.
 
 ## Contributing
 
