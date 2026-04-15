@@ -58,6 +58,28 @@ jobs:
           echo "source_tarball=${archive_path}" >> "${GITHUB_OUTPUT}"
           echo "source_sha256=${sha256}" >> "${GITHUB_OUTPUT}"
 
+      - name: Upload release package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrowave-release-${{ steps.meta.outputs.version }}
+          path: |
+            dist/retrowave-${{ steps.meta.outputs.version }}.tar.gz
+            dist/retrowave-${{ steps.meta.outputs.version }}.sha256
+            dist/retrowave.rb
+          if-no-files-found: error
+
+      - name: Write release package summary
+        run: |
+          {
+            echo "## RetroWave release package"
+            echo
+            echo "- Source tarball: \`retrowave-${{ steps.meta.outputs.version }}.tar.gz\`"
+            echo "- SHA256: \`${{ steps.package.outputs.source_sha256 }}\`"
+            echo "- Homebrew formula: \`retrowave.rb\`"
+            echo
+            echo "The same files are uploaded both as workflow artifacts and GitHub Release assets."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
