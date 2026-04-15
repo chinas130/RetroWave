@@ -13,6 +13,19 @@
 namespace retrowave {
 namespace {
 
+const char* coverArtModeLabel(CoverArtMode mode) {
+    switch (mode) {
+        case CoverArtMode::Ascii:
+            return "ASCII";
+        case CoverArtMode::BlockShading:
+            return "Block Shading";
+        case CoverArtMode::HalfBlock:
+            return "Half-Block";
+    }
+
+    return "ASCII";
+}
+
 std::size_t nextGlyphBytes(const std::string& value, std::size_t offset, int& columns) {
     if (offset >= value.size()) {
         columns = 0;
@@ -184,26 +197,15 @@ std::vector<std::string> renderPlaceholderArt(int width, int height) {
     return lines;
 }
 
-std::vector<std::string> renderAsciiArt(const std::shared_ptr<const AlbumArt>& art, int maxWidth, int maxHeight) {
-    if (!art || art->empty() || maxWidth <= 0 || maxHeight <= 0) {
-        return renderPlaceholderArt(maxWidth, maxHeight);
-    }
-
-    static const std::string kRamp = " .:-=+*#%@";
-    constexpr double kCharAspect = 0.5;
-
-    const double imageAspect = static_cast<double>(art->width) / static_cast<double>(std::max(1, art->height));
-    int targetWidth = std::max(1, std::min(maxWidth, static_cast<int>(std::round(maxHeight * imageAspect / kCharAspect))));
-    int targetHeight = std::max(1, std::min(maxHeight, static_cast<int>(std::round(targetWidth * kCharAspect / imageAspect))));
-
-    if (targetHeight > maxHeight) {
-        targetHeight = maxHeight;
-        targetWidth = std::max(1, std::min(maxWidth, static_cast<int>(std::round(targetHeight * imageAspect / kCharAspect))));
-    }
-
+std::vector<float> sampleAlbumArt(
+    const std::shared_ptr<const AlbumArt>& art,
+    int targetWidth,
+    int targetHeight,
+    float& minGray,
+    float& maxGray) {
     std::vector<float> sampled(static_cast<std::size_t>(targetWidth * targetHeight), 0.0F);
-    float minGray = 255.0F;
-    float maxGray = 0.0F;
+    minGray = 255.0F;
+    maxGray = 0.0F;
 
     for (int row = 0; row < targetHeight; ++row) {
         const int y0 = row * art->height / targetHeight;
@@ -229,22 +231,100 @@ std::vector<std::string> renderAsciiArt(const std::shared_ptr<const AlbumArt>& a
         }
     }
 
+    return sampled;
+}
+
+std::vector<std::string> renderCoverArt(
+    const std::shared_ptr<const AlbumArt>& art,
+    int maxWidth,
+    int maxHeight,
+    CoverArtMode mode) {
+    if (!art || art->empty() || maxWidth <= 0 || maxHeight <= 0) {
+        return renderPlaceholderArt(maxWidth, maxHeight);
+    }
+
+    constexpr double kCharAspect = 0.5;
+
+    const double imageAspect = static_cast<double>(art->width) / static_cast<double>(std::max(1, art->height));
+    int targetWidth = std::max(1, std::min(maxWidth, static_cast<int>(std::round(maxHeight * imageAspect / kCharAspect))));
+    int targetHeight = std::max(1, std::min(maxHeight, static_cast<int>(std::round(targetWidth * kCharAspect / imageAspect))));
+
+    if (mode == CoverArtMode::HalfBlock) {
+        targetWidth = std::max(1, std::min(maxWidth, static_cast<int>(std::round(maxHeight * imageAspect / 1.0))));
+        targetHeight = std::max(1, std::min(maxHeight * 2, static_cast<int>(std::round(targetWidth / imageAspect))));
+    }
+
+    if (targetHeight > maxHeight) {
+        targetHeight = maxHeight;
+        targetWidth = std::max(1, std::min(maxWidth, static_cast<int>(std::round(targetHeight * imageAspect / kCharAspect))));
+    }
+
+    if (mode == CoverArtMode::HalfBlock && targetHeight > maxHeight * 2) {
+        targetHeight = maxHeight * 2;
+        targetWidth = std::max(1, std::min(maxWidth, static_cast<int>(std::round((targetHeight / 2.0) * imageAspect))));
+    }
+
+    float minGray = 255.0F;
+    float maxGray = 0.0F;
+    const auto sampled = sampleAlbumArt(art, targetWidth, targetHeight, minGray, maxGray);
     const float span = std::max(1.0F, maxGray - minGray);
     std::vector<std::string> lines;
-    lines.reserve(static_cast<std::size_t>(targetHeight));
+    if (mode == CoverArtMode::Ascii) {
+        static const std::string kRamp = "  ..,,::--==++**##%%@@";
+        lines.reserve(static_cast<std::size_t>(targetHeight));
+        for (int row = 0; row < targetHeight; ++row) {
+            std::string line;
+            line.reserve(static_cast<std::size_t>(targetWidth));
 
-    for (int row = 0; row < targetHeight; ++row) {
-        std::string line;
-        line.reserve(static_cast<std::size_t>(targetWidth));
+            for (int column = 0; column < targetWidth; ++column) {
+                const float gray = sampled[static_cast<std::size_t>(row * targetWidth + column)];
+                const float normalized = std::pow(std::clamp((gray - minGray) / span, 0.0F, 1.0F), 1.12F);
+                const std::size_t rampIndex = static_cast<std::size_t>(
+                    std::round((1.0F - normalized) * static_cast<float>(kRamp.size() - 1)));
+                line.push_back(kRamp[rampIndex]);
+            }
 
-        for (int column = 0; column < targetWidth; ++column) {
-            const float gray = sampled[static_cast<std::size_t>(row * targetWidth + column)];
-            const float normalized = std::clamp((gray - minGray) / span, 0.0F, 1.0F);
-            const std::size_t rampIndex = static_cast<std::size_t>(
-                std::round((1.0F - normalized) * static_cast<float>(kRamp.size() - 1)));
-            line.push_back(kRamp[rampIndex]);
+            lines.push_back(std::move(line));
         }
+        return lines;
+    }
 
+    if (mode == CoverArtMode::BlockShading) {
+        static const std::vector<std::string> kRamp = {" ", "░", "▒", "▓", "█"};
+        lines.reserve(static_cast<std::size_t>(targetHeight));
+        for (int row = 0; row < targetHeight; ++row) {
+            std::string line;
+            for (int column = 0; column < targetWidth; ++column) {
+                const float gray = sampled[static_cast<std::size_t>(row * targetWidth + column)];
+                const float normalized = std::pow(std::clamp((gray - minGray) / span, 0.0F, 1.0F), 1.05F);
+                const std::size_t rampIndex = static_cast<std::size_t>(
+                    std::round((1.0F - normalized) * static_cast<float>(kRamp.size() - 1)));
+                line += kRamp[rampIndex];
+            }
+            lines.push_back(std::move(line));
+        }
+        return lines;
+    }
+
+    lines.reserve(static_cast<std::size_t>((targetHeight + 1) / 2));
+    for (int row = 0; row < targetHeight; row += 2) {
+        std::string line;
+        for (int column = 0; column < targetWidth; ++column) {
+            const float topGray = sampled[static_cast<std::size_t>(row * targetWidth + column)];
+            const float bottomGray = sampled[static_cast<std::size_t>(std::min(row + 1, targetHeight - 1) * targetWidth + column)];
+            const float topDark = 1.0F - std::clamp((topGray - minGray) / span, 0.0F, 1.0F);
+            const float bottomDark = 1.0F - std::clamp((bottomGray - minGray) / span, 0.0F, 1.0F);
+
+            if (topDark < 0.18F && bottomDark < 0.18F) {
+                line += " ";
+            } else if (topDark > 0.72F && bottomDark > 0.72F) {
+                line += "█";
+            } else if (topDark >= bottomDark) {
+                line += topDark > 0.38F ? "▀" : " ";
+            } else {
+                line += bottomDark > 0.38F ? "▄" : " ";
+            }
+        }
         lines.push_back(std::move(line));
     }
 
@@ -283,7 +363,10 @@ std::string lyricPrefix(const LyricLine& line, bool timed) {
 
 }  // namespace
 
-TerminalUI::TerminalUI(PlaybackEngine& engine) : engine_(engine) {}
+TerminalUI::TerminalUI(PlaybackEngine& engine) : engine_(engine) {
+    settings_ = settingsStore_.load();
+    engine_.setVolume(settings_.volume);
+}
 
 int TerminalUI::run() {
     initscr();
@@ -365,6 +448,10 @@ int TerminalUI::computePollTimeout(
     std::chrono::steady_clock::time_point now) const {
     using namespace std::chrono;
 
+    if (settingsOpen_) {
+        return 1000;
+    }
+
     if (!activeError_.empty() || !modalBody_.empty()) {
         return 180;
     }
@@ -423,13 +510,20 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_cloc
         return;
     }
 
-    const bool overlayVisible = !activeError_.empty() || !modalBody_.empty();
+    const bool overlayVisible = !activeError_.empty() || settingsOpen_ || !modalBody_.empty();
     if (!overlayVisible && overlayVisibleLastFrame_) {
         needsFullRedraw_ = true;
     }
     overlayVisibleLastFrame_ = overlayVisible;
 
     if (overlayVisible) {
+        if (settingsOpen_) {
+            wnoutrefresh(stdscr);
+            drawSettingsOverlay(rows, cols);
+            doupdate();
+            return;
+        }
+
         erase();
         if (!activeError_.empty()) {
             drawModalOverlay(rows, cols, "Error", "Playback backend or decode failure", activeError_);
@@ -662,7 +756,7 @@ void TerminalUI::drawAlbumCard(int top, int left, int height, int width, const P
 }
 
 void TerminalUI::drawCoverPane(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
-    const auto artLines = renderAsciiArt(snapshot.albumArt, width, height);
+    const auto artLines = renderCoverArt(snapshot.albumArt, width, height, settings_.coverArtMode);
     const int artTop = top + std::max(0, (height - static_cast<int>(artLines.size())) / 2);
 
     for (int row = 0; row < height; ++row) {
@@ -1004,8 +1098,82 @@ void TerminalUI::drawLegalScreen(int rows, int cols) const {
     }
 }
 
+void TerminalUI::drawSettingsOverlay(int rows, int cols) const {
+    const int overlayWidth = std::min(cols - 8, 64);
+    const int overlayHeight = 11;
+    const int top = std::max(2, (rows - overlayHeight) / 2);
+    const int left = std::max(2, (cols - overlayWidth) / 2);
+
+    WINDOW* overlay = newwin(overlayHeight, overlayWidth, top, left);
+    if (overlay == nullptr) {
+        return;
+    }
+
+    if (has_colors()) {
+        wbkgd(overlay, COLOR_PAIR(6) | ' ');
+    } else {
+        wbkgd(overlay, A_REVERSE);
+    }
+    werase(overlay);
+    box(overlay, 0, 0);
+
+    wattron(overlay, A_BOLD);
+    mvwprintw(overlay, 0, 2, " Settings ");
+    wattroff(overlay, A_BOLD);
+
+    mvwaddnstr(overlay, 2, 2, "Cover renderer", -1);
+    if (has_colors()) {
+        wattron(overlay, COLOR_PAIR(5) | A_BOLD);
+    } else {
+        wattron(overlay, A_BOLD);
+    }
+    mvwprintw(overlay, 4, 4, "< %s >", coverArtModeLabel(settings_.coverArtMode));
+    if (has_colors()) {
+        wattroff(overlay, COLOR_PAIR(5) | A_BOLD);
+    } else {
+        wattroff(overlay, A_BOLD);
+    }
+
+    mvwprintw(overlay, 6, 2, "Volume is saved automatically: %3d%%", static_cast<int>(std::round(settings_.volume * 100.0F)));
+    mvwaddnstr(overlay, 8, 2, "Left/Right switch renderer   Enter/Esc close", -1);
+
+    wnoutrefresh(overlay);
+    delwin(overlay);
+}
+
 void TerminalUI::handleInput(int key) {
-    if (!activeError_.empty() || !modalBody_.empty()) {
+    if (!activeError_.empty() || settingsOpen_ || !modalBody_.empty()) {
+        if (settingsOpen_) {
+            switch (key) {
+                case 'q':
+                case 'Q':
+                    running_ = false;
+                    return;
+                case 27:
+                case '\n':
+                case KEY_ENTER:
+                case 's':
+                case 'S':
+                    closeTransientOverlay();
+                    return;
+                case KEY_LEFT:
+                case 'h':
+                case 'H':
+                case '-':
+                    cycleCoverArtMode(-1);
+                    return;
+                case KEY_RIGHT:
+                case 'l':
+                case 'L':
+                case '+':
+                case '=':
+                    cycleCoverArtMode(1);
+                    return;
+                default:
+                    return;
+            }
+        }
+
         switch (key) {
             case 'q':
             case 'Q':
@@ -1015,13 +1183,7 @@ void TerminalUI::handleInput(int key) {
             case '\n':
             case KEY_ENTER:
             case ' ':
-                if (!activeError_.empty()) {
-                    dismissedError_ = activeError_;
-                }
-                activeError_.clear();
-                modalTitle_.clear();
-                modalSubtitle_.clear();
-                modalBody_.clear();
+                closeTransientOverlay();
                 return;
             default:
                 return;
@@ -1067,14 +1229,22 @@ void TerminalUI::handleInput(int key) {
         case '+':
         case '=':
             engine_.adjustVolume(0.05F);
+            settings_.volume = engine_.snapshot().volume;
+            persistSettings();
             return;
         case '-':
         case '_':
             engine_.adjustVolume(-0.05F);
+            settings_.volume = engine_.snapshot().volume;
+            persistSettings();
             return;
         case 't':
         case 'T':
             detailMode_ = detailMode_ == DetailMode::Visualizer ? DetailMode::Lyrics : DetailMode::Visualizer;
+            return;
+        case 's':
+        case 'S':
+            openSettingsOverlay();
             return;
         case 'w':
         case 'W':
@@ -1104,6 +1274,7 @@ void TerminalUI::syncErrorOverlay(const PlaybackSnapshot& snapshot) {
 }
 
 void TerminalUI::openWarrantyOverlay() {
+    settingsOpen_ = false;
     modalTitle_ = "Warranty";
     modalSubtitle_ = "RetroWave legal notice";
     modalBody_ =
@@ -1113,12 +1284,49 @@ void TerminalUI::openWarrantyOverlay() {
 }
 
 void TerminalUI::openConditionsOverlay() {
+    settingsOpen_ = false;
     modalTitle_ = "Conditions";
     modalSubtitle_ = "RetroWave legal notice";
     modalBody_ =
         "RetroWave Copyright (C) 2026 Viktor Voloshko. "
         "This is free software, and you are welcome to redistribute it under certain conditions. "
         "RetroWave is licensed under GPLv3. See LICENSE.txt for the complete redistribution and modification terms.";
+}
+
+void TerminalUI::openSettingsOverlay() {
+    modalTitle_.clear();
+    modalSubtitle_.clear();
+    modalBody_.clear();
+    settingsOpen_ = true;
+}
+
+void TerminalUI::closeTransientOverlay() {
+    if (!activeError_.empty()) {
+        dismissedError_ = activeError_;
+    }
+    activeError_.clear();
+    modalTitle_.clear();
+    modalSubtitle_.clear();
+    modalBody_.clear();
+    settingsOpen_ = false;
+    needsFullRedraw_ = true;
+}
+
+void TerminalUI::cycleCoverArtMode(int delta) {
+    const int modeCount = 3;
+    int next = static_cast<int>(settings_.coverArtMode) + delta;
+    if (next < 0) {
+        next = modeCount - 1;
+    } else if (next >= modeCount) {
+        next = 0;
+    }
+
+    settings_.coverArtMode = static_cast<CoverArtMode>(next);
+    persistSettings();
+}
+
+void TerminalUI::persistSettings() {
+    settingsStore_.save(settings_);
 }
 
 }  // namespace retrowave

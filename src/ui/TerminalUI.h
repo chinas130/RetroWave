@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio/PlaybackEngine.h"
+#include "core/Settings.h"
 
 #include <chrono>
 #include <limits>
@@ -58,12 +59,19 @@ class TerminalUI {
     void drawLyrics(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
     void drawModalOverlay(int rows, int cols, const std::string& title, const std::string& subtitle, const std::string& body) const;
     void drawLegalScreen(int rows, int cols) const;
+    void drawSettingsOverlay(int rows, int cols) const;
     void handleInput(int key);
     void syncErrorOverlay(const PlaybackSnapshot& snapshot);
     void openWarrantyOverlay();
     void openConditionsOverlay();
+    void openSettingsOverlay();
+    void closeTransientOverlay();
+    void cycleCoverArtMode(int delta);
+    void persistSettings();
 
     PlaybackEngine& engine_;
+    SettingsStore settingsStore_;
+    AppSettings settings_;
     std::size_t selectedIndex_ = 0;
     bool running_ = true;
     std::string activeError_;
@@ -71,6 +79,7 @@ class TerminalUI {
     std::string modalTitle_;
     std::string modalSubtitle_;
     std::string modalBody_;
+    bool settingsOpen_ = false;
     mutable std::vector<float> visualizerState_;
     mutable std::size_t visualizerTick_ = 0;
     DetailMode detailMode_ = DetailMode::Visualizer;

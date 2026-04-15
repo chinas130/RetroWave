@@ -224,6 +224,10 @@ void PlaybackEngine::adjustVolume(float delta) {
     volume_.store(clamp(volume_.load() + delta, 0.0F, 1.2F));
 }
 
+void PlaybackEngine::setVolume(float value) {
+    volume_.store(clamp(value, 0.0F, 1.2F));
+}
+
 PlaybackSnapshot PlaybackEngine::snapshot() const {
     std::lock_guard lock(mutex_);
 

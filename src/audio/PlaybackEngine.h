@@ -55,6 +55,7 @@ class PlaybackEngine {
     void next();
     void previous();
     void adjustVolume(float delta);
+    void setVolume(float value);
 
     [[nodiscard]] PlaybackSnapshot snapshot() const;
     [[nodiscard]] const Playlist& playlist() const noexcept;

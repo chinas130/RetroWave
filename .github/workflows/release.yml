@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing git tag to package, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      source_sha256: ${{ steps.package.outputs.source_sha256 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          version="${tag#v}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Package source archive and formula
+        id: package
+        run: |
+          mkdir -p dist
+          archive_path="$(./scripts/homebrew/create-source-tarball.sh "${{ steps.meta.outputs.tag }}" dist)"
+          sha256="$(sha256sum "${archive_path}" | awk '{print $1}')"
+          printf '%s  %s\n' "${sha256}" "$(basename "${archive_path}")" > "dist/retrowave-${{ steps.meta.outputs.version }}.sha256"
+          ./scripts/homebrew/render-formula.sh \
+            "${{ steps.meta.outputs.version }}" \
+            "${sha256}" \
+            "${GITHUB_REPOSITORY}" \
+            "dist/retrowave.rb"
+          echo "source_tarball=${archive_path}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha256=${sha256}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.source_tarball }}
+            dist/retrowave-${{ steps.meta.outputs.version }}.sha256
+            dist/retrowave.rb
+
+      - name: Update Homebrew tap
+        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' && secrets.HOMEBREW_TAP_TOKEN != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Publish formula into Homebrew tap
+        if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' && secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p homebrew-tap/Formula
+          cp dist/retrowave.rb homebrew-tap/Formula/retrowave.rb
+          cd homebrew-tap
+          if [[ -z "$(git status --porcelain -- Formula/retrowave.rb)" ]]; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/retrowave.rb
+          git commit -m "retrowave ${VERSION}"
+          git push

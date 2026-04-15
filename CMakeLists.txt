@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(GNUInstallDirs)
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswresample libswscale)
 pkg_check_modules(NCURSESW REQUIRED IMPORTED_TARGET ncursesw)
@@ -33,6 +35,7 @@ add_executable(retrowave
     src/audio/PlaybackEngine.cpp
     src/core/Lyrics.cpp
     src/core/Playlist.cpp
+    src/core/Settings.cpp
     src/ui/TerminalUI.cpp
     ${AUDIO_OUTPUT_SOURCES}
 )
@@ -47,3 +50,15 @@ target_link_libraries(retrowave
 )
 
 target_compile_options(retrowave PRIVATE -Wall -Wextra -Wpedantic)
+
+install(TARGETS retrowave
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(FILES man/man1/retrowave.1
+    DESTINATION ${CMAKE_INSTALL_MANDIR}/man1
+)
+
+install(FILES LICENSE.txt NOTICE README.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+)

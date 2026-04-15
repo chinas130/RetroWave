@@ -22,15 +22,17 @@ Playlist navigation in an
 .Xr ncurses 3
 interface
 .It
-Playback through macOS AudioToolbox
+Playback through macOS AudioToolbox or Linux ALSA
 .It
-ASCII album card rendered from embedded cover art or nearby image files
+Album card rendered from embedded cover art or nearby image files
 .It
 Animated visualizer with auto gain
 .It
 Lyrics mode backed by local
 .Pa .lrc
 files
+.It
+Persisted settings for volume and cover renderer
 .El
 .Sh HOTKEYS
 .Bl -tag -width Ds
@@ -48,6 +50,8 @@ Play previous track
 Adjust volume
 .It t
 Toggle between visualizer and lyrics panel
+.It s
+Open the settings modal
 .It w
 Show warranty notice
 .It c
