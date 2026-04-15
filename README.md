@@ -218,9 +218,31 @@ GitHub Actions now covers two paths:
   - runs a small CLI smoke test
 - `.github/workflows/release.yml`
   - triggers on tags like `v0.1.0`
+  - builds binary packages on `ubuntu-latest` and `macos-latest`
   - creates a source tarball release asset
   - emits a matching `sha256` file
   - renders a ready-to-publish `retrowave.rb` Homebrew formula
+
+## GitHub Releases
+
+GitHub Releases are always attached to git tags, but users should download builds from the release page rather than the tag page.
+
+To publish a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The `Release` workflow creates a GitHub Release for that tag and uploads assets such as:
+
+- `retrowave-0.1.0-linux-x86_64.tar.gz`
+- `retrowave-0.1.0-macos-arm64.tar.gz` or another macOS runner architecture
+- `retrowave-0.1.0.tar.gz`
+- `retrowave-0.1.0.sha256`
+- `retrowave.rb`
+
+The binary packages contain the installed `bin`, `share/man`, and `share/doc` tree. They are convenience builds, not fully static bundles, so FFmpeg/ncurses/audio backend runtime libraries still need to be available on the target system.
 
 ## Personal Homebrew Tap Flow
 
@@ -231,18 +253,15 @@ The release workflow can update a personal Homebrew tap. This is separate from p
    - `HOMEBREW_TAP_REPOSITORY=yourname/homebrew-retrowave`
 3. Add a repository secret with write access to that tap:
    - `HOMEBREW_TAP_TOKEN`
-4. Push a release tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+4. Push a release tag as shown in the GitHub Releases section.
 
 That tag will publish:
 
 - `retrowave-0.1.0.tar.gz`
 - `retrowave-0.1.0.sha256`
 - `retrowave.rb`
+
+It will also publish the macOS/Linux binary archives on the GitHub Release page.
 
 If the tap repository variable and token are configured, the workflow also updates `Formula/retrowave.rb` in the tap automatically.
 
