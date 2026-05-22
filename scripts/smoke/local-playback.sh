@@ -17,8 +17,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp "${repo_root}/assets-test-tone.wav" "${tmp_dir}/tone-a.wav"
-cp "${repo_root}/assets-test-tone.wav" "${tmp_dir}/tone-b.wav"
+python3 "${repo_root}/scripts/smoke/generate-test-tone.py" "${tmp_dir}/tone-a.wav"
+cp "${tmp_dir}/tone-a.wav" "${tmp_dir}/tone-b.wav"
 cat > "${tmp_dir}/playlist.m3u" <<EOF
 #EXTM3U
 #EXTINF:1,Smoke Tone A
