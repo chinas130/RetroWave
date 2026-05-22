@@ -1,13 +1,21 @@
 #include "audio/AudioStreamDecoder.h"
 
+#include "audio/YtDlpResolver.h"
+
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libswresample/swresample.h>
@@ -25,6 +33,57 @@ std::string ffmpegError(int errorCode) {
     return std::string(buffer);
 }
 
+bool looksLikeHlsUrl(const std::string& input) {
+    std::string lower = input;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char symbol) {
+        return static_cast<char>(std::tolower(symbol));
+    });
+
+    const auto query = input.find_first_of("?#");
+    const auto path = input.substr(0, query);
+    return path.ends_with(".m3u8") ||
+        path.ends_with(".m3u") ||
+        path.ends_with(".M3U8") ||
+        path.ends_with(".M3U") ||
+        lower.find("hls_playlist") != std::string::npos ||
+        lower.find("manifest.googlevideo.com") != std::string::npos;
+}
+
+bool looksLikeHlsPlaylistFile(const std::filesystem::path& path) {
+    if (!std::filesystem::is_regular_file(path)) {
+        return false;
+    }
+
+    std::ifstream input(path);
+    if (!input) {
+        return false;
+    }
+
+    std::string line;
+    for (int inspectedLines = 0; inspectedLines < 64 && std::getline(input, line); ++inspectedLines) {
+        line.erase(line.begin(), std::find_if(line.begin(), line.end(), [](unsigned char symbol) {
+            return !std::isspace(symbol);
+        }));
+        std::transform(line.begin(), line.end(), line.begin(), [](unsigned char symbol) {
+            return static_cast<char>(std::tolower(symbol));
+        });
+        if (line.starts_with("#ext-x-")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+double inferDurationSeconds(const AVFormatContext* formatContext, const AVStream* stream) {
+    if (formatContext != nullptr && formatContext->duration > 0) {
+        return static_cast<double>(formatContext->duration) / static_cast<double>(AV_TIME_BASE);
+    }
+    if (stream != nullptr && stream->duration > 0) {
+        return static_cast<double>(stream->duration) * av_q2d(stream->time_base);
+    }
+    return 0.0;
+}
+
 }  // namespace
 
 AudioStreamDecoder::AudioStreamDecoder() = default;
@@ -34,27 +93,66 @@ AudioStreamDecoder::~AudioStreamDecoder() {
 }
 
 void AudioStreamDecoder::open(const std::filesystem::path& path) {
+    if (looksLikeHlsUrl(path.string()) || looksLikeHlsPlaylistFile(path)) {
+        openConvertedInput(path.string(), path.filename().string());
+        return;
+    }
+
+    openInput(path.string(), path.filename().string());
+}
+
+void AudioStreamDecoder::openUrl(const std::string& url) {
+    if (looksLikeHlsUrl(url) || YtDlpResolver::isYouTubeUrl(url)) {
+        openConvertedInput(url, url);
+        return;
+    }
+
+    openInput(url, url);
+}
+
+void AudioStreamDecoder::openInput(const std::string& input, const std::string& label) {
     close();
 
-    const std::string pathString = path.string();
-    if (avformat_open_input(&formatContext_, pathString.c_str(), nullptr, nullptr) < 0) {
-        throw std::runtime_error("Cannot open stream for " + path.filename().string());
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "timeout", "7000000", 0);
+    av_dict_set(&options, "user_agent", "RetroWave/0.1", 0);
+    av_dict_set(&options, "reconnect", "1", 0);
+    av_dict_set(&options, "reconnect_streamed", "1", 0);
+    av_dict_set(&options, "reconnect_delay_max", "5", 0);
+    av_dict_set(&options, "allowed_extensions", "ALL", 0);
+    av_dict_set(&options, "protocol_whitelist", "file,http,https,tcp,tls,crypto,pipe,data", 0);
+
+    const int openResult = avformat_open_input(&formatContext_, input.c_str(), nullptr, &options);
+    av_dict_free(&options);
+    if (openResult < 0) {
+        close();
+        openConvertedInput(input, label);
+        return;
     }
 
     const int infoResult = avformat_find_stream_info(formatContext_, nullptr);
     if (infoResult < 0) {
-        throw std::runtime_error("Cannot inspect stream info: " + ffmpegError(infoResult));
+        close();
+        openConvertedInput(input, label);
+        return;
     }
 
     audioStreamIndex_ = av_find_best_stream(formatContext_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (audioStreamIndex_ < 0) {
-        throw std::runtime_error("No audio stream found: " + ffmpegError(audioStreamIndex_));
+        close();
+        openConvertedInput(input, label);
+        return;
     }
 
     AVStream* stream = formatContext_->streams[audioStreamIndex_];
+    durationSeconds_ = inferDurationSeconds(formatContext_, stream);
+    live_ = durationSeconds_ <= 0.0;
+
     const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
     if (codec == nullptr) {
-        throw std::runtime_error("Unsupported codec for " + path.filename().string());
+        close();
+        openConvertedInput(input, label);
+        return;
     }
 
     codecContext_ = avcodec_alloc_context3(codec);
@@ -67,9 +165,9 @@ void AudioStreamDecoder::open(const std::filesystem::path& path) {
         throw std::runtime_error("Cannot copy codec parameters: " + ffmpegError(parameterResult));
     }
 
-    const int openResult = avcodec_open2(codecContext_, codec, nullptr);
-    if (openResult < 0) {
-        throw std::runtime_error("Cannot open streaming decoder: " + ffmpegError(openResult));
+    const int codecOpenResult = avcodec_open2(codecContext_, codec, nullptr);
+    if (codecOpenResult < 0) {
+        throw std::runtime_error("Cannot open streaming decoder: " + ffmpegError(codecOpenResult));
     }
 
     AVChannelLayout outLayout;
@@ -114,8 +212,68 @@ void AudioStreamDecoder::open(const std::filesystem::path& path) {
     clearPendingSamples();
 }
 
+void AudioStreamDecoder::openConvertedInput(const std::string& input, const std::string& label) {
+    close();
+
+    std::string converterInput = input;
+    durationSeconds_ = 0.0;
+    live_ = true;
+    if (YtDlpResolver::isYouTubeUrl(input)) {
+        const auto media = YtDlpResolver::resolve(input);
+        converterInput = media.url;
+        durationSeconds_ = media.durationSeconds;
+        live_ = durationSeconds_ <= 0.0;
+        if (converterInput.empty()) {
+            throw std::runtime_error("Cannot resolve YouTube audio URL. Install yt-dlp or refresh the stream URL.");
+        }
+    }
+
+    const std::vector<std::string> args = {
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5",
+        "-protocol_whitelist",
+        "file,http,https,tcp,tls,crypto,pipe,data",
+        "-user_agent",
+        "RetroWave/0.1",
+        "-i",
+        converterInput,
+        "-vn",
+        "-f",
+        "s16le",
+        "-ac",
+        "2",
+        "-ar",
+        "44100",
+        "pipe:1",
+    };
+
+    if (!converterProcess_.startStdout(args)) {
+        throw std::runtime_error("Cannot start ffmpeg converter for " + label);
+    }
+
+    eof_ = false;
+    readEof_ = false;
+    flushSent_ = false;
+    clearPendingSamples();
+}
+
+void AudioStreamDecoder::requestStop() {
+    converterProcess_.requestStop();
+}
+
 void AudioStreamDecoder::close() {
     clearPendingSamples();
+
+    converterProcess_.terminate();
 
     if (frame_ != nullptr) {
         av_frame_free(&frame_);
@@ -135,13 +293,19 @@ void AudioStreamDecoder::close() {
 
     audioStreamIndex_ = -1;
     eof_ = false;
+    live_ = false;
     readEof_ = false;
     flushSent_ = false;
+    durationSeconds_ = 0.0;
 }
 
 std::size_t AudioStreamDecoder::readFrames(std::int16_t* destination, std::size_t maxFrames) {
     if (destination == nullptr || maxFrames == 0) {
         return 0;
+    }
+
+    if (converterProcess_.active()) {
+        return readConvertedFrames(destination, maxFrames);
     }
 
     std::size_t writtenFrames = 0;
@@ -172,8 +336,31 @@ std::size_t AudioStreamDecoder::readFrames(std::int16_t* destination, std::size_
     return writtenFrames;
 }
 
+std::size_t AudioStreamDecoder::readConvertedFrames(std::int16_t* destination, std::size_t maxFrames) {
+    FILE* stream = converterProcess_.stdoutStream();
+    if (stream == nullptr) {
+        eof_ = true;
+        return 0;
+    }
+
+    const std::size_t samplesRequested = maxFrames * static_cast<std::size_t>(kOutputChannels);
+    const std::size_t samplesRead = std::fread(destination, sizeof(std::int16_t), samplesRequested, stream);
+    if (samplesRead < samplesRequested) {
+        eof_ = true;
+    }
+    return samplesRead / static_cast<std::size_t>(kOutputChannels);
+}
+
 bool AudioStreamDecoder::eof() const noexcept {
     return eof_;
+}
+
+double AudioStreamDecoder::durationSeconds() const noexcept {
+    return durationSeconds_;
+}
+
+bool AudioStreamDecoder::live() const noexcept {
+    return live_;
 }
 
 int AudioStreamDecoder::sampleRate() const noexcept {
@@ -264,7 +451,16 @@ bool AudioStreamDecoder::decodeNextChunk() {
 
 void AudioStreamDecoder::clearPendingSamples() {
     pendingSamples_.clear();
+    pendingSamples_.shrink_to_fit();
     pendingOffset_ = 0;
+}
+
+AVFormatContext* AudioStreamDecoder::formatContext() const noexcept {
+    return formatContext_;
+}
+
+int AudioStreamDecoder::audioStreamIndex() const noexcept {
+    return audioStreamIndex_;
 }
 
 }  // namespace retrowave

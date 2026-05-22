@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 namespace retrowave {
@@ -22,6 +23,23 @@ CoverArtMode parseCoverArtMode(const std::string& value) {
     return CoverArtMode::Ascii;
 }
 
+RepeatMode parseRepeatMode(const std::string& value) {
+    if (value == "one") {
+        return RepeatMode::One;
+    }
+    if (value == "all") {
+        return RepeatMode::All;
+    }
+    return RepeatMode::Off;
+}
+
+ShuffleMode parseShuffleMode(const std::string& value) {
+    if (value == "on") {
+        return ShuffleMode::On;
+    }
+    return ShuffleMode::Off;
+}
+
 const char* coverArtModeName(CoverArtMode mode) {
     switch (mode) {
         case CoverArtMode::Ascii:
@@ -33,6 +51,30 @@ const char* coverArtModeName(CoverArtMode mode) {
     }
 
     return "ascii";
+}
+
+const char* repeatModeName(RepeatMode mode) {
+    switch (mode) {
+        case RepeatMode::Off:
+            return "off";
+        case RepeatMode::One:
+            return "one";
+        case RepeatMode::All:
+            return "all";
+    }
+
+    return "off";
+}
+
+const char* shuffleModeName(ShuffleMode mode) {
+    switch (mode) {
+        case ShuffleMode::Off:
+            return "off";
+        case ShuffleMode::On:
+            return "on";
+    }
+
+    return "off";
 }
 
 }  // namespace
@@ -65,6 +107,16 @@ AppSettings SettingsStore::load() const {
 
         if (key == "cover_art_mode") {
             settings.coverArtMode = parseCoverArtMode(value);
+            continue;
+        }
+
+        if (key == "repeat_mode") {
+            settings.repeatMode = parseRepeatMode(value);
+            continue;
+        }
+
+        if (key == "shuffle_mode") {
+            settings.shuffleMode = parseShuffleMode(value);
         }
     }
 
@@ -76,14 +128,39 @@ bool SettingsStore::save(const AppSettings& settings) const {
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
 
-    std::ofstream output(path, std::ios::trunc);
-    if (!output.is_open()) {
+    std::ostringstream content;
+    content << "volume=" << clampVolume(settings.volume) << '\n';
+    content << "cover_art_mode=" << coverArtModeName(settings.coverArtMode) << '\n';
+    content << "repeat_mode=" << repeatModeName(settings.repeatMode) << '\n';
+    content << "shuffle_mode=" << shuffleModeName(settings.shuffleMode) << '\n';
+
+    const auto temporaryPath = path.string() + ".tmp";
+    {
+        std::ofstream output(temporaryPath, std::ios::trunc);
+        if (!output.is_open()) {
+            return false;
+        }
+
+        output << content.str();
+        if (!output.good()) {
+            std::filesystem::remove(temporaryPath, error);
+            return false;
+        }
+    }
+
+    std::filesystem::rename(temporaryPath, path, error);
+    if (error) {
+        std::filesystem::remove(path, error);
+        error.clear();
+        std::filesystem::rename(temporaryPath, path, error);
+    }
+
+    if (error) {
+        std::filesystem::remove(temporaryPath, error);
         return false;
     }
 
-    output << "volume=" << clampVolume(settings.volume) << '\n';
-    output << "cover_art_mode=" << coverArtModeName(settings.coverArtMode) << '\n';
-    return output.good();
+    return true;
 }
 
 std::filesystem::path SettingsStore::settingsPath() const {

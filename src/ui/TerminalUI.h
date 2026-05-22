@@ -2,8 +2,10 @@
 
 #include "audio/PlaybackEngine.h"
 #include "core/Settings.h"
+#include "ui/MediaSession.h"
 
 #include <chrono>
+#include <csignal>
 #include <limits>
 #include <string>
 #include <vector>
@@ -17,7 +19,9 @@ enum class DetailMode {
 
 class TerminalUI {
   public:
-    explicit TerminalUI(PlaybackEngine& engine);
+    explicit TerminalUI(PlaybackEngine& engine, const volatile std::sig_atomic_t* shutdownSignal = nullptr);
+    ~TerminalUI();
+
     int run();
 
   private:
@@ -48,7 +52,7 @@ class TerminalUI {
         const PlaybackSnapshot& snapshot,
         std::chrono::steady_clock::time_point now) const;
     void clearRect(const Rect& rect) const;
-    void drawHeader(const Rect& rect) const;
+    void drawHeader(const Rect& rect, const PlaybackSnapshot& snapshot) const;
     void drawFrame(int top, int left, int height, int width, const char* title) const;
     void drawPlaylist(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
     void drawAlbumCard(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
@@ -67,9 +71,15 @@ class TerminalUI {
     void openSettingsOverlay();
     void closeTransientOverlay();
     void cycleCoverArtMode(int delta);
+    void cycleRepeatMode();
+    void cycleShuffleMode();
+    [[nodiscard]] bool shutdownRequested() const noexcept;
+    void flushSettingsFromEngine();
     void persistSettings();
+    void syncMediaSession(const PlaybackSnapshot& snapshot);
 
     PlaybackEngine& engine_;
+    const volatile std::sig_atomic_t* shutdownSignal_ = nullptr;
     SettingsStore settingsStore_;
     AppSettings settings_;
     std::size_t selectedIndex_ = 0;
@@ -95,14 +105,19 @@ class TerminalUI {
     std::string lastAlbum_;
     std::string lastErrorText_;
     bool lastHasTrack_ = false;
-    bool lastPaused_ = false;
-    bool lastLoading_ = false;
+    PlaybackState lastPlaybackState_ = PlaybackState::Idle;
     bool lastLyricsFound_ = false;
     int lastVolumePercent_ = -1;
+    RepeatMode lastRepeatMode_ = RepeatMode::Off;
+    ShuffleMode lastShuffleMode_ = ShuffleMode::Off;
     int lastPositionSecond_ = std::numeric_limits<int>::min();
     int lastActiveLyricIndex_ = std::numeric_limits<int>::min();
     DetailMode lastDetailMode_ = DetailMode::Visualizer;
     std::chrono::steady_clock::time_point lastVisualizerRedraw_{};
+    std::string lastMediaPath_;
+    PlaybackState lastMediaState_ = PlaybackState::Idle;
+    int lastMediaPositionSecond_ = std::numeric_limits<int>::min();
+    MediaSession mediaSession_;
 };
 
 }  // namespace retrowave

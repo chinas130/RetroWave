@@ -26,6 +26,30 @@ const char* coverArtModeLabel(CoverArtMode mode) {
     return "ASCII";
 }
 
+const char* repeatModeLabel(RepeatMode mode) {
+    switch (mode) {
+        case RepeatMode::Off:
+            return "off";
+        case RepeatMode::One:
+            return "one";
+        case RepeatMode::All:
+            return "all";
+    }
+
+    return "off";
+}
+
+const char* shuffleModeLabel(ShuffleMode mode) {
+    switch (mode) {
+        case ShuffleMode::Off:
+            return "off";
+        case ShuffleMode::On:
+            return "on";
+    }
+
+    return "off";
+}
+
 std::size_t nextGlyphBytes(const std::string& value, std::size_t offset, int& columns) {
     if (offset >= value.size()) {
         columns = 0;
@@ -119,6 +143,33 @@ std::string formatTime(double seconds) {
     }
     stream << remainder;
     return stream.str();
+}
+
+std::string formatDuration(double seconds, bool live) {
+    if (live || seconds <= 0.0) {
+        return "LIVE";
+    }
+    return formatTime(seconds);
+}
+
+std::string playbackStateLabel(PlaybackState state) {
+    switch (state) {
+        case PlaybackState::Idle:
+            return "idle";
+        case PlaybackState::Loading:
+            return "loading";
+        case PlaybackState::Playing:
+            return "playing";
+        case PlaybackState::Paused:
+            return "paused";
+        case PlaybackState::Buffering:
+            return "buffering";
+        case PlaybackState::Ended:
+            return "ended";
+        case PlaybackState::Failed:
+            return "failed";
+    }
+    return "unknown";
 }
 
 std::vector<std::string> wrapText(const std::string& text, int width) {
@@ -361,11 +412,54 @@ std::string lyricPrefix(const LyricLine& line, bool timed) {
     return stream.str();
 }
 
+double lineProgress(const LyricLine& line, double positionSeconds) {
+    if (line.timestampSeconds < 0.0 || line.endTimestampSeconds < 0.0) {
+        return 0.0;
+    }
+    const double duration = line.endTimestampSeconds - line.timestampSeconds;
+    if (duration <= 0.0) {
+        return 1.0;
+    }
+    return std::clamp((positionSeconds - line.timestampSeconds) / duration, 0.0, 1.0);
+}
+
+int activeSegmentIndex(const LyricLine& line, double positionSeconds) {
+    if (!line.hasWordSync()) {
+        return -1;
+    }
+    int current = -1;
+    for (std::size_t i = 0; i < line.segments.size(); ++i) {
+        if (line.segments[i].timestampSeconds <= positionSeconds) {
+            current = static_cast<int>(i);
+        } else {
+            break;
+        }
+    }
+    return current;
+}
+
 }  // namespace
 
-TerminalUI::TerminalUI(PlaybackEngine& engine) : engine_(engine) {
+TerminalUI::TerminalUI(PlaybackEngine& engine, const volatile std::sig_atomic_t* shutdownSignal)
+    : engine_(engine), shutdownSignal_(shutdownSignal) {
     settings_ = settingsStore_.load();
     engine_.setVolume(settings_.volume);
+    engine_.setRepeatMode(settings_.repeatMode);
+    engine_.setShuffleMode(settings_.shuffleMode);
+
+    mediaSession_.setOnPlayPause([this]() { engine_.togglePause(); });
+    mediaSession_.setOnNext([this]() {
+        engine_.next();
+        selectedIndex_ = engine_.snapshot().currentIndex;
+    });
+    mediaSession_.setOnPrevious([this]() {
+        engine_.previous();
+        selectedIndex_ = engine_.snapshot().currentIndex;
+    });
+}
+
+TerminalUI::~TerminalUI() {
+    flushSettingsFromEngine();
 }
 
 int TerminalUI::run() {
@@ -385,8 +479,11 @@ int TerminalUI::run() {
         init_pair(6, COLOR_BLACK, COLOR_CYAN);
     }
 
-    while (running_) {
+    while (running_ && !shutdownRequested()) {
         engine_.update();
+        if (detailMode_ == DetailMode::Lyrics) {
+            engine_.ensureLyrics();
+        }
         PlaybackSnapshot snapshot = engine_.snapshot();
         syncErrorOverlay(snapshot);
 
@@ -400,9 +497,16 @@ int TerminalUI::run() {
         engine_.update();
         snapshot = engine_.snapshot();
         syncErrorOverlay(snapshot);
+        syncMediaSession(snapshot);
+        mediaSession_.pumpEvents();
+
+        if (snapshot.hasTrack && snapshot.currentIndex != lastCurrentIndex_) {
+            selectedIndex_ = snapshot.currentIndex;
+        }
         draw(snapshot, std::chrono::steady_clock::now());
     }
 
+    flushSettingsFromEngine();
     endwin();
     return 0;
 }
@@ -482,12 +586,29 @@ void TerminalUI::clearRect(const Rect& rect) const {
     }
 }
 
-void TerminalUI::drawHeader(const Rect& rect) const {
+void TerminalUI::drawHeader(const Rect& rect, const PlaybackSnapshot& snapshot) const {
     mvhline(rect.top, rect.left, ' ', rect.width);
     attron(COLOR_PAIR(1) | A_BOLD);
     mvprintw(rect.top, rect.left + 2, "RetroWave");
     attroff(COLOR_PAIR(1) | A_BOLD);
     mvprintw(rect.top, rect.left + 14, "Terminal player with ASCII album art and .lrc lyrics");
+
+    const std::string shuffleText = std::string("Shuffle: ") + shuffleModeLabel(snapshot.shuffleMode);
+    const std::string repeatText = std::string("Repeat: ") + repeatModeLabel(snapshot.repeatMode);
+    const int shuffleLeft = rect.left + rect.width - static_cast<int>(shuffleText.size()) - 2;
+    const int repeatLeft = shuffleLeft - static_cast<int>(repeatText.size()) - 3;
+    
+    if (repeatLeft > rect.left + 54) {
+        attron(A_BOLD);
+        mvprintw(rect.top, repeatLeft, "%s", repeatText.c_str());
+        attroff(A_BOLD);
+    }
+    
+    if (shuffleLeft > rect.left + 54) {
+        attron(A_BOLD);
+        mvprintw(rect.top, shuffleLeft, "%s", shuffleText.c_str());
+        attroff(A_BOLD);
+    }
 }
 
 void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_clock::time_point now) {
@@ -551,15 +672,18 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_cloc
     }
 
     const bool fullRedraw = needsFullRedraw_;
+    const bool headerDirty = fullRedraw || snapshot.repeatMode != lastRepeatMode_ ||
+        snapshot.shuffleMode != lastShuffleMode_;
     const bool playlistDirty =
         fullRedraw || selectedIndex_ != lastSelectedIndex_ || snapshot.currentIndex != lastCurrentIndex_ ||
         snapshot.hasTrack != lastHasTrack_;
     const bool coverDirty = fullRedraw || snapshot.path != lastTrackPath_;
     const bool metaDirty =
         fullRedraw || snapshot.path != lastTrackPath_ || snapshot.title != lastTitle_ || snapshot.artist != lastArtist_ ||
-        snapshot.album != lastAlbum_ || snapshot.paused != lastPaused_ || snapshot.loading != lastLoading_ ||
+        snapshot.album != lastAlbum_ || snapshot.state != lastPlaybackState_ ||
         (snapshot.lyrics && snapshot.lyrics->found) != lastLyricsFound_ ||
-        static_cast<int>(std::round(snapshot.volume * 100.0F)) != lastVolumePercent_;
+        static_cast<int>(std::round(snapshot.volume * 100.0F)) != lastVolumePercent_ ||
+        snapshot.repeatMode != lastRepeatMode_ || snapshot.shuffleMode != lastShuffleMode_;
     const bool timeDirty =
         fullRedraw || snapshot.path != lastTrackPath_ ||
         static_cast<int>(std::round(snapshot.positionSeconds)) != lastPositionSecond_;
@@ -577,13 +701,24 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_cloc
     } else {
         const int activeLyricIndex =
             snapshot.lyrics ? currentLyricIndex(*snapshot.lyrics, snapshot.positionSeconds) : -1;
-        detailDirty = detailDirty || snapshot.path != lastTrackPath_ || activeLyricIndex != lastActiveLyricIndex_;
+        
+        // If we have timed lyrics, we need frequent redraws for the progress bar and word highlighting
+        bool timedRedrawDue = false;
+        if (snapshot.lyrics && snapshot.lyrics->timed && activeLyricIndex >= 0) {
+            timedRedrawDue = lastVisualizerRedraw_.time_since_epoch().count() == 0 ||
+                             now - lastVisualizerRedraw_ >= std::chrono::milliseconds(100);
+        }
+
+        detailDirty = detailDirty || snapshot.path != lastTrackPath_ || activeLyricIndex != lastActiveLyricIndex_ || timedRedrawDue;
         lastActiveLyricIndex_ = activeLyricIndex;
+        if (detailDirty) {
+            lastVisualizerRedraw_ = now; // reuse visualizer timer for lyrics too
+        }
     }
 
     if (fullRedraw) {
         erase();
-        drawHeader(layout_.header);
+        drawHeader(layout_.header, snapshot);
         drawFrame(
             layout_.playlistFrame.top,
             layout_.playlistFrame.left,
@@ -610,6 +745,10 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_cloc
             layout_.detailFrame.height,
             layout_.detailFrame.width,
             detailMode_ == DetailMode::Lyrics ? "Lyrics" : "Visualizer");
+    }
+
+    if (headerDirty && !fullRedraw) {
+        drawHeader(layout_.header, snapshot);
     }
 
     if (playlistDirty) {
@@ -671,10 +810,11 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_cloc
     lastArtist_ = snapshot.artist;
     lastAlbum_ = snapshot.album;
     lastHasTrack_ = snapshot.hasTrack;
-    lastPaused_ = snapshot.paused;
-    lastLoading_ = snapshot.loading;
+    lastPlaybackState_ = snapshot.state;
     lastLyricsFound_ = snapshot.lyrics && snapshot.lyrics->found;
     lastVolumePercent_ = static_cast<int>(std::round(snapshot.volume * 100.0F));
+    lastRepeatMode_ = snapshot.repeatMode;
+    lastShuffleMode_ = snapshot.shuffleMode;
     lastPositionSecond_ = static_cast<int>(std::round(snapshot.positionSeconds));
     lastDetailMode_ = detailMode_;
 }
@@ -781,17 +921,20 @@ void TerminalUI::drawMetaPane(int top, int left, int height, int width, const Pl
         return;
     }
 
-    const std::string state = snapshot.loading ? "loading" : (snapshot.paused ? "paused" : "playing");
+    const std::string state = playbackStateLabel(snapshot.state);
     const std::string lyricsStatus = snapshot.lyrics && snapshot.lyrics->found ? "loaded" : "missing";
 
     std::vector<std::string> lines;
-    lines.reserve(7);
+    lines.reserve(9);
     lines.push_back(trimText(snapshot.title, width));
     lines.push_back({});
     lines.push_back("Artist : " + trimText(snapshot.artist.empty() ? "Unknown" : snapshot.artist, std::max(0, width - 9)));
     lines.push_back("Album  : " + trimText(snapshot.album.empty() ? "Unknown" : snapshot.album, std::max(0, width - 9)));
+    lines.push_back(std::string("Source : ") + (snapshot.remote ? (snapshot.live ? "stream" : "online") : "local"));
     lines.push_back("State  : " + trimText(state, std::max(0, width - 9)));
     lines.push_back("Volume : " + std::to_string(static_cast<int>(std::round(snapshot.volume * 100.0F))) + "%");
+    lines.push_back(std::string("Repeat : ") + repeatModeLabel(snapshot.repeatMode));
+    lines.push_back(std::string("Shuffle: ") + shuffleModeLabel(snapshot.shuffleMode));
     lines.push_back("Lyrics : " + lyricsStatus);
 
     for (int row = 0; row < height; ++row) {
@@ -827,13 +970,13 @@ void TerminalUI::drawTimePane(int top, int left, int height, int width, const Pl
         drawTextLine(top, left, width, "Time");
         attroff(A_DIM);
         attron(A_BOLD);
-        drawTextLine(top + 1, left, width, formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds));
+        drawTextLine(top + 1, left, width, formatTime(snapshot.positionSeconds) + " / " + formatDuration(snapshot.durationSeconds, snapshot.live));
         attroff(A_BOLD);
         return;
     }
 
     attron(A_BOLD);
-    drawTextLine(top, left, width, "Time : " + formatTime(snapshot.positionSeconds) + " / " + formatTime(snapshot.durationSeconds));
+    drawTextLine(top, left, width, "Time : " + formatTime(snapshot.positionSeconds) + " / " + formatDuration(snapshot.durationSeconds, snapshot.live));
     attroff(A_BOLD);
 }
 
@@ -904,21 +1047,34 @@ void TerminalUI::drawVisualizer(int top, int left, int height, int width, const 
 void TerminalUI::drawLyrics(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const {
     if (!snapshot.lyrics || !snapshot.lyrics->found) {
         const std::string message = snapshot.lyrics ? snapshot.lyrics->message : "Could not find .lrc lyrics for this track.";
+        if (has_colors()) {
+            attron(A_DIM);
+        }
         drawTextLine(top + height / 2, left, width, message);
+        if (has_colors()) {
+            attroff(A_DIM);
+        }
         return;
     }
 
     if (snapshot.lyrics->lines.empty()) {
+        if (has_colors()) {
+            attron(A_DIM);
+        }
         drawTextLine(top + height / 2, left, width, snapshot.lyrics->message);
+        if (has_colors()) {
+            attroff(A_DIM);
+        }
         return;
     }
 
-    const int bodyRows = std::max(1, height - 1);
+    const int statusRows = 2;
+    const int bodyRows = std::max(1, height - statusRows);
     const int activeIndex = currentLyricIndex(*snapshot.lyrics, snapshot.positionSeconds);
 
     int firstVisible = 0;
     if (snapshot.lyrics->timed && activeIndex >= 0) {
-        firstVisible = std::max(0, activeIndex - std::max(1, bodyRows / 2));
+        firstVisible = std::max(0, activeIndex - std::max(1, bodyRows / 3));
         firstVisible = std::min(
             firstVisible,
             std::max(0, static_cast<int>(snapshot.lyrics->lines.size()) - bodyRows));
@@ -932,34 +1088,154 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
 
         const auto& lyric = snapshot.lyrics->lines[static_cast<std::size_t>(lineIndex)];
         const std::string prefix = lyricPrefix(lyric, snapshot.lyrics->timed);
-        const std::string rendered = trimText(prefix + lyric.text, width);
         const bool isActive = lineIndex == activeIndex;
+        const bool isNext = snapshot.lyrics->timed && lineIndex == activeIndex + 1;
         const bool isPast = snapshot.lyrics->timed && activeIndex >= 0 && lineIndex < activeIndex;
+        const int distFromActive = isPast ? (activeIndex - lineIndex) : 0;
 
-        if (isActive) {
+        if (isActive && snapshot.lyrics->enhanced && lyric.hasWordSync()) {
+            // Enhanced LRC: karaoke word-by-word rendering
+            const int segIdx = activeSegmentIndex(lyric, snapshot.positionSeconds);
+            const std::string indicator = "▸ " + prefix;
+
+            // Draw the indicator
             if (has_colors()) {
                 attron(COLOR_PAIR(3) | A_BOLD);
             } else {
                 attron(A_BOLD);
             }
-        } else if (isPast) {
-            attron(A_DIM);
-        }
-
-        drawTextLine(top + row, left, width, rendered);
-
-        if (isActive) {
+            mvprintw(top + row, left, "%s", trimText(indicator, width).c_str());
             if (has_colors()) {
                 attroff(COLOR_PAIR(3) | A_BOLD);
             } else {
                 attroff(A_BOLD);
             }
+
+            // Draw word segments with progressive highlighting
+            int col = left + static_cast<int>(indicator.size());
+            const int maxCol = left + width;
+            for (int si = 0; si < static_cast<int>(lyric.segments.size()) && col < maxCol; ++si) {
+                const auto& seg = lyric.segments[static_cast<std::size_t>(si)];
+                const std::string word = seg.text + " ";
+                const bool segDone = si < segIdx;
+                const bool segActive = si == segIdx;
+
+                if (segActive) {
+                    if (has_colors()) {
+                        attron(COLOR_PAIR(3) | A_BOLD);
+                    } else {
+                        attron(A_BOLD | A_UNDERLINE);
+                    }
+                } else if (segDone) {
+                    if (has_colors()) {
+                        attron(COLOR_PAIR(2));
+                    }
+                } else {
+                    if (has_colors()) {
+                        attron(A_DIM);
+                    }
+                }
+
+                const int remaining = maxCol - col;
+                const std::string clipped = word.substr(0, static_cast<std::size_t>(std::max(0, remaining)));
+                mvprintw(top + row, col, "%s", clipped.c_str());
+                col += static_cast<int>(clipped.size());
+
+                if (segActive) {
+                    if (has_colors()) {
+                        attroff(COLOR_PAIR(3) | A_BOLD);
+                    } else {
+                        attroff(A_BOLD | A_UNDERLINE);
+                    }
+                } else if (segDone) {
+                    if (has_colors()) {
+                        attroff(COLOR_PAIR(2));
+                    }
+                } else {
+                    if (has_colors()) {
+                        attroff(A_DIM);
+                    }
+                }
+            }
+        } else if (isActive) {
+            // Standard synced: highlight the full active line with progress indicator
+            const std::string indicator = "▸ ";
+            const std::string rendered = trimText(indicator + prefix + lyric.text, width);
+
+            if (has_colors()) {
+                attron(COLOR_PAIR(3) | A_BOLD);
+            } else {
+                attron(A_BOLD);
+            }
+            drawTextLine(top + row, left, width, rendered);
+            if (has_colors()) {
+                attroff(COLOR_PAIR(3) | A_BOLD);
+            } else {
+                attroff(A_BOLD);
+            }
+
+            // Draw a progress bar under the active line if there's room
+            if (snapshot.lyrics->timed && row + 1 < bodyRows) {
+                const double progress = lineProgress(lyric, snapshot.positionSeconds);
+                const int barWidth = std::max(0, width - 2);
+                const int filled = static_cast<int>(std::round(progress * barWidth));
+
+                mvhline(top + row + 1, left, ' ', width);
+                if (barWidth > 0 && has_colors()) {
+                    attron(COLOR_PAIR(4));
+                    for (int b = 0; b < barWidth; ++b) {
+                        mvaddch(top + row + 1, left + 1 + b, b < filled ? ACS_HLINE : ' ');
+                    }
+                    attroff(COLOR_PAIR(4));
+                }
+
+                // Skip the progress bar row in the lyric line loop
+                ++row;
+            }
+        } else if (isNext) {
+            // Next line: subtle highlight to preview what's coming
+            const std::string rendered = trimText("  " + prefix + lyric.text, width);
+            if (has_colors()) {
+                attron(COLOR_PAIR(1));
+            }
+            drawTextLine(top + row, left, width, rendered);
+            if (has_colors()) {
+                attroff(COLOR_PAIR(1));
+            }
         } else if (isPast) {
+            // Past lines: gradient dim — recently past lines are less dim
+            const std::string rendered = trimText("  " + prefix + lyric.text, width);
+            attron(A_DIM);
+            if (distFromActive <= 2 && has_colors()) {
+                attron(COLOR_PAIR(2));
+            }
+            drawTextLine(top + row, left, width, rendered);
+            if (distFromActive <= 2 && has_colors()) {
+                attroff(COLOR_PAIR(2));
+            }
             attroff(A_DIM);
+        } else {
+            // Future lines (beyond next): normal dim
+            const std::string rendered = trimText("  " + prefix + lyric.text, width);
+            drawTextLine(top + row, left, width, rendered);
         }
     }
 
-    drawTextLine(top + height - 1, left, width, snapshot.lyrics->message);
+    // Status line at bottom
+    std::string statusText = snapshot.lyrics->message;
+    if (snapshot.lyrics->timed && activeIndex >= 0) {
+        const auto& activeLine = snapshot.lyrics->lines[static_cast<std::size_t>(activeIndex)];
+        const double progress = lineProgress(activeLine, snapshot.positionSeconds);
+        const int pct = static_cast<int>(std::round(progress * 100.0));
+
+        std::string typeLabel = snapshot.lyrics->enhanced ? "enhanced" : "synced";
+        statusText = statusText + "  " + std::to_string(activeIndex + 1) + "/" +
+                     std::to_string(snapshot.lyrics->lines.size()) + "  " + typeLabel + "  " +
+                     std::to_string(pct) + "%";
+    }
+    attron(A_DIM);
+    drawTextLine(top + height - 1, left, width, statusText);
+    attroff(A_DIM);
 }
 
 void TerminalUI::drawModalOverlay(
@@ -1100,7 +1376,7 @@ void TerminalUI::drawLegalScreen(int rows, int cols) const {
 
 void TerminalUI::drawSettingsOverlay(int rows, int cols) const {
     const int overlayWidth = std::min(cols - 8, 64);
-    const int overlayHeight = 11;
+    const int overlayHeight = 13;
     const int top = std::max(2, (rows - overlayHeight) / 2);
     const int left = std::max(2, (cols - overlayWidth) / 2);
 
@@ -1135,7 +1411,10 @@ void TerminalUI::drawSettingsOverlay(int rows, int cols) const {
     }
 
     mvwprintw(overlay, 6, 2, "Volume is saved automatically: %3d%%", static_cast<int>(std::round(settings_.volume * 100.0F)));
-    mvwaddnstr(overlay, 8, 2, "Left/Right switch renderer   Enter/Esc close", -1);
+    mvwprintw(overlay, 7, 2, "Repeat mode: %s", repeatModeLabel(settings_.repeatMode));
+    mvwprintw(overlay, 8, 2, "Shuffle mode: %s", shuffleModeLabel(settings_.shuffleMode));
+    mvwaddnstr(overlay, 10, 2, "Left/Right switch renderer   r repeat mode   h shuffle mode", -1);
+    mvwaddnstr(overlay, 10, 2, "Enter/Esc close", -1);
 
     wnoutrefresh(overlay);
     delwin(overlay);
@@ -1157,17 +1436,21 @@ void TerminalUI::handleInput(int key) {
                     closeTransientOverlay();
                     return;
                 case KEY_LEFT:
-                case 'h':
-                case 'H':
                 case '-':
                     cycleCoverArtMode(-1);
                     return;
                 case KEY_RIGHT:
-                case 'l':
-                case 'L':
                 case '+':
                 case '=':
                     cycleCoverArtMode(1);
+                    return;
+                case 'r':
+                case 'R':
+                    cycleRepeatMode();
+                    return;
+                case 'h':
+                case 'H':
+                    cycleShuffleMode();
                     return;
                 default:
                     return;
@@ -1214,17 +1497,13 @@ void TerminalUI::handleInput(int key) {
             return;
         case 'n':
         case 'N':
-            if (selectedIndex_ + 1 < engine_.playlist().size()) {
-                ++selectedIndex_;
-            }
             engine_.next();
+            selectedIndex_ = engine_.snapshot().currentIndex;
             return;
         case 'p':
         case 'P':
-            if (selectedIndex_ > 0) {
-                --selectedIndex_;
-            }
             engine_.previous();
+            selectedIndex_ = engine_.snapshot().currentIndex;
             return;
         case '+':
         case '=':
@@ -1241,6 +1520,14 @@ void TerminalUI::handleInput(int key) {
         case 't':
         case 'T':
             detailMode_ = detailMode_ == DetailMode::Visualizer ? DetailMode::Lyrics : DetailMode::Visualizer;
+            return;
+        case 'r':
+        case 'R':
+            cycleRepeatMode();
+            return;
+        case 'h':
+        case 'H':
+            cycleShuffleMode();
             return;
         case 's':
         case 'S':
@@ -1322,6 +1609,68 @@ void TerminalUI::cycleCoverArtMode(int delta) {
     }
 
     settings_.coverArtMode = static_cast<CoverArtMode>(next);
+    persistSettings();
+}
+
+void TerminalUI::cycleRepeatMode() {
+    switch (settings_.repeatMode) {
+        case RepeatMode::Off:
+            settings_.repeatMode = RepeatMode::One;
+            break;
+        case RepeatMode::One:
+            settings_.repeatMode = RepeatMode::All;
+            break;
+        case RepeatMode::All:
+            settings_.repeatMode = RepeatMode::Off;
+            break;
+    }
+
+    engine_.setRepeatMode(settings_.repeatMode);
+    persistSettings();
+}
+
+void TerminalUI::cycleShuffleMode() {
+    settings_.shuffleMode = settings_.shuffleMode == ShuffleMode::Off ? ShuffleMode::On : ShuffleMode::Off;
+    engine_.setShuffleMode(settings_.shuffleMode);
+    persistSettings();
+}
+
+bool TerminalUI::shutdownRequested() const noexcept {
+    return shutdownSignal_ != nullptr && *shutdownSignal_ != 0;
+}
+
+void TerminalUI::syncMediaSession(const PlaybackSnapshot& snapshot) {
+    if (!snapshot.hasTrack) {
+        return;
+    }
+
+    const int positionSecond = static_cast<int>(std::round(snapshot.positionSeconds));
+    const bool trackChanged = snapshot.path != lastMediaPath_;
+    const bool stateChanged = snapshot.state != lastMediaState_;
+    const bool positionChanged = positionSecond != lastMediaPositionSecond_;
+    if (!trackChanged && !stateChanged && !positionChanged) {
+        return;
+    }
+
+    const bool isPlaying =
+        snapshot.state == PlaybackState::Playing || snapshot.state == PlaybackState::Buffering;
+    mediaSession_.updateNowPlaying(
+        snapshot.title,
+        snapshot.artist,
+        snapshot.album,
+        snapshot.durationSeconds,
+        snapshot.positionSeconds);
+    mediaSession_.updatePlaybackState(isPlaying);
+
+    lastMediaPath_ = snapshot.path;
+    lastMediaState_ = snapshot.state;
+    lastMediaPositionSecond_ = positionSecond;
+}
+
+void TerminalUI::flushSettingsFromEngine() {
+    settings_.volume = engine_.snapshot().volume;
+    settings_.repeatMode = engine_.repeatMode();
+    settings_.shuffleMode = engine_.shuffleMode();
     persistSettings();
 }
 

@@ -6,15 +6,23 @@
 .Nd terminal music player with ASCII album art, playlists, and LRC lyrics
 .Sh SYNOPSIS
 .Nm
-.Op Ar file_or_directory ...
+.Op Ar file_or_directory_url_or_playlist ...
 .Sh DESCRIPTION
 .Nm
-is a local terminal music player for browsing directories of music, decoding tracks with FFmpeg, rendering album art as ASCII, and showing synchronized lyrics from nearby
+is a local terminal music player for browsing directories of music, decoding tracks and streams with FFmpeg, rendering album art as ASCII, and showing synchronized lyrics from nearby
 .Pa .lrc
 files.
 If no input paths are provided,
 .Nm
 scans the current working directory recursively for supported audio files.
+.Pp
+.Nm
+can also open direct remote stream URLs and simple local or remote
+.Pa .m3u ,
+.Pa .m3u8 ,
+and
+.Pa .pls
+playlists.
 .Sh FEATURES
 .Bl -bullet -compact
 .It
@@ -33,6 +41,8 @@ Lyrics mode backed by local
 files
 .It
 Persisted settings for volume and cover renderer
+.It
+Direct remote stream and radio URL playback through FFmpeg
 .El
 .Sh HOTKEYS
 .Bl -tag -width Ds
@@ -48,6 +58,8 @@ Play next track
 Play previous track
 .It + / -
 Adjust volume
+.It r
+Cycle repeat mode between off, one, and all
 .It t
 Toggle between visualizer and lyrics panel
 .It s
@@ -66,6 +78,23 @@ Lyrics are loaded from a file with the same stem as the current track, for examp
 .Dl song.lrc
 .Pp
 Timed LRC lines are highlighted and auto-scrolled during playback.
+.Nm
+supports LRC metadata tags, repeated timestamps on one line,
+.Ql [offset:+/-milliseconds] ,
+and timestamp forms such as
+.Ql [mm:ss.xx] ,
+.Ql [mm:ss.xxx] ,
+and
+.Ql [hh:mm:ss.xxx] .
+If no sidecar file exists,
+.Nm
+tries embedded lyrics metadata such as
+.Ql lyrics ,
+.Ql syncedlyrics ,
+.Ql unsyncedlyrics ,
+.Ql USLT ,
+or
+.Ql SYLT .
 If no matching
 .Pa .lrc
 file is found, the lyrics panel reports that lyrics are unavailable.
@@ -85,6 +114,26 @@ looks for nearby files named:
 relies on FFmpeg for decoding and supports common formats including:
 .Pp
 .Dl mp3, flac, wav, m4a, ogg, opus, aac, aiff, alac, wma
+.Pp
+It also accepts direct stream URLs and simple local or remote
+.Pa .m3u ,
+.Pa .m3u8 ,
+and
+.Pa .pls
+playlists.
+HLS
+.Pa .m3u8
+playlists containing
+.Pa #EXT-X-*
+tags are treated as one live stream and passed to FFmpeg directly.
+YouTube-style HLS manifests are decoded through an on-the-fly
+.Xr ffmpeg 1
+PCM pipe when needed.
+YouTube page URLs require
+.Xr yt-dlp 1
+to resolve a direct audio stream before FFmpeg playback.
+Remote sources with known duration are treated as finite online tracks.
+Only streams with unknown or zero duration are shown as live.
 .Sh EXAMPLES
 .Bl -tag -width Ds
 .It
@@ -96,6 +145,14 @@ Play a specific music folder:
 .Pp
 .Dl retrowave ~/Music
 .It
+Play a direct remote stream:
+.Pp
+.Dl retrowave https://example.com/radio.mp3
+.It
+Open a station playlist:
+.Pp
+.Dl retrowave stations.m3u
+.It
 Open this manual from the project root:
 .Pp
 .Dl MANPATH="$PWD/man" man retrowave
@@ -105,7 +162,7 @@ Open this manual from the project root:
 .It Pa man/man1/retrowave.1
 Project manual page
 .It Pa *.lrc
-Optional local lyrics files placed next to tracks
+Optional local lyrics files placed next to tracks; embedded lyrics tags are used as fallback
 .El
 .Sh EXIT STATUS
 .Ex -std

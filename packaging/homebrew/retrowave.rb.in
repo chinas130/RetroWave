@@ -10,6 +10,7 @@ class Retrowave < Formula
   depends_on "pkgconf" => :build
   depends_on "ffmpeg"
   depends_on "ncurses"
+  depends_on "yt-dlp"
 
   on_linux do
     depends_on "alsa-lib"

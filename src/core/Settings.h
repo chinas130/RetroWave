@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/PlaybackMode.h"
+
 #include <filesystem>
 
 namespace retrowave {
@@ -13,6 +15,8 @@ enum class CoverArtMode {
 struct AppSettings {
     float volume = 0.85F;
     CoverArtMode coverArtMode = CoverArtMode::Ascii;
+    RepeatMode repeatMode = RepeatMode::Off;
+    ShuffleMode shuffleMode = ShuffleMode::Off;
 };
 
 class SettingsStore {

@@ -1,3 +1,7 @@
 build/
 .DS_Store
 assets-test-tone.wav
+scratch_event.mm
+scratch_main.mm
+scratch_test.mm
+scratch_test

@@ -1,22 +1,19 @@
 #pragma once
 
-#include <cstdint>
+#include "audio/AudioDecoder.h"
+
 #include <deque>
 #include <filesystem>
 #include <mutex>
 #include <optional>
-#include <string>
 #include <unordered_map>
-#include <vector>
 
 namespace retrowave {
 
-inline constexpr std::size_t kWaveformBinCount = 160;
-
-class WaveformCache {
+class MetadataCache {
   public:
-    void store(const std::filesystem::path& path, std::vector<float> waveform);
-    [[nodiscard]] std::optional<std::vector<float>> get(const std::filesystem::path& path) const;
+    [[nodiscard]] std::optional<TrackMetadata> get(const std::filesystem::path& path) const;
+    void store(const std::filesystem::path& path, TrackMetadata metadata);
 
   private:
     struct CacheKey {
@@ -39,7 +36,7 @@ class WaveformCache {
 
     static constexpr std::size_t maxReadyEntries_ = 6;
     mutable std::mutex mutex_;
-    std::unordered_map<CacheKey, std::vector<float>, CacheKeyHash> ready_;
+    std::unordered_map<CacheKey, TrackMetadata, CacheKeyHash> ready_;
     std::deque<CacheKey> readyOrder_;
 };
 

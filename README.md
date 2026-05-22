@@ -23,18 +23,20 @@ Current scope:
 - Linux audio output via ALSA
 - decoding through FFmpeg
 - terminal UI via `ncurses`
-- local lyrics lookup from sibling `.lrc` files
+- local lyrics lookup from sibling `.lrc` files or embedded lyrics tags
 - album art extraction from embedded art or nearby image files
 
 Current limitations:
 
 - no official Homebrew bottle or tap publication yet
 - no seek support yet
-- no shuffle/repeat mode yet
+- no shuffle mode yet
 
 ## Features
 
 - Browse and play local files or directories recursively
+- Play direct remote streams and radio URLs supported by FFmpeg
+- Load simple local or remote `.m3u`, `.m3u8`, and `.pls` playlists
 - Support for common formats via FFmpeg: `mp3`, `flac`, `wav`, `m4a`, `ogg`, `opus`, `aac`, `aiff`, `alac`, `wma`
 - Album card with metadata and multiple text-mode cover renderers: `ASCII`, `Block Shading`, `Half-Block`
 - Toggle between `Visualizer` and `Lyrics` panels with `t`
@@ -67,19 +69,21 @@ If no path is provided, RetroWave scans the current working directory recursivel
   - `libavutil`
   - `libswresample`
   - `libswscale`
+- `ffmpeg` executable for on-the-fly conversion of HLS/YouTube-style streams
+- Optional: `yt-dlp` for resolving YouTube page URLs from playlists into direct audio streams
 - `ncurses`
 - ALSA development headers on Linux
 
 ### Example install with Homebrew
 
 ```bash
-brew install cmake pkg-config ffmpeg ncurses
+brew install cmake pkg-config ffmpeg ncurses yt-dlp
 ```
 
 On Debian/Ubuntu:
 
 ```bash
-sudo apt install cmake pkg-config libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libswscale-dev libncursesw5-dev libasound2-dev
+sudo apt install cmake pkg-config ffmpeg yt-dlp libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libswscale-dev libncursesw5-dev libasound2-dev
 ```
 
 ## Build
@@ -116,6 +120,21 @@ You can pass:
 - a single track
 - multiple files
 - one or more directories
+- a direct stream URL
+- a local or remote `.m3u`, `.m3u8`, or `.pls` playlist
+
+Examples:
+
+```bash
+./build/retrowave ~/Music https://example.com/radio.mp3
+./build/retrowave stations.m3u
+./build/retrowave https://somafm.com/m3u/groovesalad.m3u
+```
+
+Remote sources are split into finite online tracks and live/unknown streams. If FFmpeg or `yt-dlp` exposes a duration, RetroWave shows normal progress and advances on EOF; otherwise the source is shown as `LIVE`.
+HLS `.m3u8` playlists with `#EXT-X-*` tags are treated as a single live stream and passed to FFmpeg directly.
+YouTube-style HLS manifests are decoded through an on-the-fly `ffmpeg` PCM pipe because those streams are often not stable as plain playlist entries.
+YouTube page URLs require `yt-dlp`; RetroWave resolves them to a direct audio URL first and then streams that URL through FFmpeg.
 
 ## Manual Page
 
@@ -133,6 +152,7 @@ MANPATH="$PWD/man" man retrowave
 - `n`: play next track
 - `p`: play previous track
 - `+` / `-`: adjust volume
+- `r`: cycle repeat mode: off, one, all
 - `t`: toggle visualizer and lyrics panel
 - `s`: open settings modal
 - `w`: show warranty notice
@@ -154,7 +174,15 @@ If timed lyrics are present:
 - past lines are dimmed
 - the panel auto-scrolls to keep the current line in view
 
+Supported LRC features:
+
+- `[offset:+/-milliseconds]`
+- metadata tags such as `[ar:]`, `[ti:]`, `[al:]`, `[by:]`, and `[length:]`
+- timestamps like `[mm:ss.xx]`, `[mm:ss.xxx]`, and `[hh:mm:ss.xxx]`
+- repeated timestamps on one line, for example `[00:10.00][00:20.00] chorus`
+
 If no `.lrc` file is found, the lyrics panel shows a clear fallback message.
+If no sidecar file exists, RetroWave also tries embedded lyrics metadata such as `lyrics`, `syncedlyrics`, `unsyncedlyrics`, `USLT`, or `SYLT`.
 
 ## Album Art
 
@@ -203,7 +231,7 @@ Recent optimization work includes:
 ## Roadmap
 
 - seeking
-- shuffle / repeat
+- shuffle
 - better album-art downsampling for tiny embedded covers
 - richer metadata display
 - disk-backed waveform cache
@@ -216,11 +244,34 @@ GitHub Actions now covers two paths:
   - builds on `ubuntu-latest` and `macos-latest`
   - verifies `cmake --install`
   - runs a small CLI smoke test
+  - runs `scripts/smoke/local-playback.sh` through a pseudo-terminal to catch TUI playback lifecycle regressions
 - `.github/workflows/release.yml`
   - triggers on tags like `v0.1.0`
+  - builds binary packages on `ubuntu-latest` and `macos-latest`
   - creates a source tarball release asset
   - emits a matching `sha256` file
   - renders a ready-to-publish `retrowave.rb` Homebrew formula
+
+## GitHub Releases
+
+GitHub Releases are always attached to git tags, but users should download builds from the release page rather than the tag page.
+
+To publish a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The `Release` workflow creates a GitHub Release for that tag and uploads assets such as:
+
+- `retrowave-0.1.0-linux-x86_64.tar.gz`
+- `retrowave-0.1.0-macos-arm64.tar.gz` or another macOS runner architecture
+- `retrowave-0.1.0.tar.gz`
+- `retrowave-0.1.0.sha256`
+- `retrowave.rb`
+
+The binary packages contain the installed `bin`, `share/man`, and `share/doc` tree. They are convenience builds, not fully static bundles, so FFmpeg/ncurses/audio backend runtime libraries still need to be available on the target system.
 
 ## Personal Homebrew Tap Flow
 
@@ -231,18 +282,15 @@ The release workflow can update a personal Homebrew tap. This is separate from p
    - `HOMEBREW_TAP_REPOSITORY=yourname/homebrew-retrowave`
 3. Add a repository secret with write access to that tap:
    - `HOMEBREW_TAP_TOKEN`
-4. Push a release tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+4. Push a release tag as shown in the GitHub Releases section.
 
 That tag will publish:
 
 - `retrowave-0.1.0.tar.gz`
 - `retrowave-0.1.0.sha256`
 - `retrowave.rb`
+
+It will also publish the macOS/Linux binary archives on the GitHub Release page.
 
 If the tap repository variable and token are configured, the workflow also updates `Formula/retrowave.rb` in the tap automatically.
 

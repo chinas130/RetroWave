@@ -112,7 +112,14 @@ Suggested commands:
 
 ```bash
 bash ./rebuild.sh
+scripts/smoke/local-playback.sh
 ./build/retrowave /path/to/music
+```
+
+Optional remote playback smoke:
+
+```bash
+RETROWAVE_YOUTUBE_URL="https://www.youtube.com/watch?v=YjzQm_34aVw" scripts/smoke/youtube-playback.sh
 ```
 
 ## Pull Requests

@@ -19,6 +19,18 @@ void checkStatus(OSStatus status, const char* message) {
     }
 }
 
+void swapStereoChannels(std::int16_t* samples, std::size_t frames) {
+    if (samples == nullptr) {
+        return;
+    }
+
+    for (std::size_t frame = 0; frame < frames; ++frame) {
+        const auto left = frame * kChannelCount;
+        const auto right = left + 1;
+        std::swap(samples[left], samples[right]);
+    }
+}
+
 }  // namespace
 
 struct AudioOutput::Impl {
@@ -36,6 +48,16 @@ struct AudioOutput::Impl {
         checkStatus(
             AudioQueueNewOutput(&description, &Impl::handleBuffer, this, nullptr, nullptr, 0, &queue_),
             "Unable to create audio queue");
+
+        AudioChannelLayout channelLayout{};
+        channelLayout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
+        checkStatus(
+            AudioQueueSetProperty(
+                queue_,
+                kAudioQueueProperty_ChannelLayout,
+                &channelLayout,
+                sizeof(channelLayout)),
+            "Unable to set stereo channel layout");
 
         buffers_.reserve(AudioOutput::bufferCount());
         for (std::size_t index = 0; index < AudioOutput::bufferCount(); ++index) {
@@ -90,6 +112,7 @@ struct AudioOutput::Impl {
     void fillAndEnqueue(AudioQueueBufferRef buffer) {
         auto* samples = static_cast<std::int16_t*>(buffer->mAudioData);
         const std::size_t framesWritten = render_(samples, AudioOutput::framesPerBuffer());
+        swapStereoChannels(samples, framesWritten);
         const auto bytesWritten = static_cast<std::uint32_t>(
             std::max<std::size_t>(framesWritten, AudioOutput::framesPerBuffer()) * sizeof(std::int16_t) * kChannelCount);
 

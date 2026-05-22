@@ -15,21 +15,13 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  prepare:
     runs-on: ubuntu-latest
-    env:
-      HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     outputs:
+      tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
-      source_sha256: ${{ steps.package.outputs.source_sha256 }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Resolve release metadata
         id: meta
         run: |
@@ -43,54 +35,145 @@ jobs:
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
+  build-binaries:
+    name: Binary package (${{ matrix.os }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            pkg-config \
+            libavformat-dev \
+            libavcodec-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libncursesw5-dev \
+            libasound2-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          brew install ffmpeg ncurses pkg-config
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install to package root
+        run: cmake --install build --prefix "${RUNNER_TEMP}/retrowave-install"
+
+      - name: Package binary archive
+        id: package
+        run: |
+          mkdir -p dist
+          archive_path="$(./scripts/release/package-binary.sh "${{ needs.prepare.outputs.version }}" "${RUNNER_TEMP}/retrowave-install" dist)"
+          echo "archive_path=${archive_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload binary package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrowave-binary-${{ matrix.os }}
+          path: |
+            dist/retrowave-${{ needs.prepare.outputs.version }}-*.tar.gz
+            dist/retrowave-${{ needs.prepare.outputs.version }}-*.sha256
+          if-no-files-found: error
+
+  source-package:
+    needs: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha256: ${{ steps.package.outputs.source_sha256 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.tag }}
+
       - name: Package source archive and formula
         id: package
         run: |
           mkdir -p dist
-          archive_path="$(./scripts/homebrew/create-source-tarball.sh "${{ steps.meta.outputs.tag }}" dist)"
+          archive_path="$(./scripts/homebrew/create-source-tarball.sh "${{ needs.prepare.outputs.tag }}" dist)"
           sha256="$(sha256sum "${archive_path}" | awk '{print $1}')"
-          printf '%s  %s\n' "${sha256}" "$(basename "${archive_path}")" > "dist/retrowave-${{ steps.meta.outputs.version }}.sha256"
+          printf '%s  %s\n' "${sha256}" "$(basename "${archive_path}")" > "dist/retrowave-${{ needs.prepare.outputs.version }}.sha256"
           ./scripts/homebrew/render-formula.sh \
-            "${{ steps.meta.outputs.version }}" \
+            "${{ needs.prepare.outputs.version }}" \
             "${sha256}" \
             "${GITHUB_REPOSITORY}" \
             "dist/retrowave.rb"
-          echo "source_tarball=${archive_path}" >> "${GITHUB_OUTPUT}"
           echo "source_sha256=${sha256}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload release package artifact
+      - name: Upload source package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: retrowave-release-${{ steps.meta.outputs.version }}
+          name: retrowave-source-${{ needs.prepare.outputs.version }}
           path: |
-            dist/retrowave-${{ steps.meta.outputs.version }}.tar.gz
-            dist/retrowave-${{ steps.meta.outputs.version }}.sha256
+            dist/retrowave-${{ needs.prepare.outputs.version }}.tar.gz
+            dist/retrowave-${{ needs.prepare.outputs.version }}.sha256
             dist/retrowave.rb
           if-no-files-found: error
+
+  release:
+    needs:
+      - prepare
+      - build-binaries
+      - source-package
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: retrowave-*
+          merge-multiple: true
 
       - name: Write release package summary
         run: |
           {
-            echo "## RetroWave release package"
+            echo "## RetroWave release assets"
             echo
-            echo "- Source tarball: \`retrowave-${{ steps.meta.outputs.version }}.tar.gz\`"
-            echo "- SHA256: \`${{ steps.package.outputs.source_sha256 }}\`"
+            echo "- Source tarball: \`retrowave-${{ needs.prepare.outputs.version }}.tar.gz\`"
+            echo "- Source SHA256: \`${{ needs.source-package.outputs.source_sha256 }}\`"
             echo "- Homebrew formula: \`retrowave.rb\`"
-            echo
-            echo "The same files are uploaded both as workflow artifacts and GitHub Release assets."
+            echo "- Binary packages:"
+            find dist -maxdepth 1 -type f -name "retrowave-${{ needs.prepare.outputs.version }}-*.tar.gz" -printf "  - \`%f\`\n" | sort
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
           fail_on_unmatched_files: true
-          files: |
-            ${{ steps.package.outputs.source_tarball }}
-            dist/retrowave-${{ steps.meta.outputs.version }}.sha256
-            dist/retrowave.rb
+          files: dist/*
 
-      - name: Update Homebrew tap
+      - name: Checkout Homebrew tap
         if: ${{ env.HOMEBREW_TAP_REPOSITORY != '' && env.HOMEBREW_TAP_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
@@ -101,7 +184,7 @@ jobs:
       - name: Publish formula into Homebrew tap
         if: ${{ env.HOMEBREW_TAP_REPOSITORY != '' && env.HOMEBREW_TAP_TOKEN != '' }}
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           mkdir -p homebrew-tap/Formula
           cp dist/retrowave.rb homebrew-tap/Formula/retrowave.rb

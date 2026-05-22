@@ -1,23 +1,11 @@
-#include "audio/WaveformCache.h"
+#include "audio/MetadataCache.h"
 
 #include <algorithm>
 #include <system_error>
 
 namespace retrowave {
 
-void WaveformCache::store(const std::filesystem::path& path, std::vector<float> waveform) {
-    if (waveform.empty()) {
-        return;
-    }
-
-    const auto key = makeKey(path);
-    std::lock_guard lock(mutex_);
-    ready_[key] = std::move(waveform);
-    touchReadyKey(key);
-    evictIfNeeded();
-}
-
-std::optional<std::vector<float>> WaveformCache::get(const std::filesystem::path& path) const {
+std::optional<TrackMetadata> MetadataCache::get(const std::filesystem::path& path) const {
     const auto key = makeKey(path);
     std::lock_guard lock(mutex_);
     const auto it = ready_.find(key);
@@ -27,7 +15,15 @@ std::optional<std::vector<float>> WaveformCache::get(const std::filesystem::path
     return it->second;
 }
 
-void WaveformCache::touchReadyKey(const CacheKey& key) {
+void MetadataCache::store(const std::filesystem::path& path, TrackMetadata metadata) {
+    const auto key = makeKey(path);
+    std::lock_guard lock(mutex_);
+    ready_[key] = std::move(metadata);
+    touchReadyKey(key);
+    evictIfNeeded();
+}
+
+void MetadataCache::touchReadyKey(const CacheKey& key) {
     auto it = std::find(readyOrder_.begin(), readyOrder_.end(), key);
     if (it != readyOrder_.end()) {
         readyOrder_.erase(it);
@@ -35,7 +31,7 @@ void WaveformCache::touchReadyKey(const CacheKey& key) {
     readyOrder_.push_back(key);
 }
 
-void WaveformCache::evictIfNeeded() {
+void MetadataCache::evictIfNeeded() {
     while (ready_.size() > maxReadyEntries_ && !readyOrder_.empty()) {
         const CacheKey evicted = readyOrder_.front();
         readyOrder_.pop_front();
@@ -43,14 +39,14 @@ void WaveformCache::evictIfNeeded() {
     }
 }
 
-std::size_t WaveformCache::CacheKeyHash::operator()(const CacheKey& key) const noexcept {
+std::size_t MetadataCache::CacheKeyHash::operator()(const CacheKey& key) const noexcept {
     std::size_t hash = std::hash<std::string>{}(key.path);
     hash ^= std::hash<std::uintmax_t>{}(key.fileSize) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
     hash ^= std::hash<std::int64_t>{}(key.writeTick) + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
     return hash;
 }
 
-WaveformCache::CacheKey WaveformCache::makeKey(const std::filesystem::path& path) {
+MetadataCache::CacheKey MetadataCache::makeKey(const std::filesystem::path& path) {
     std::error_code error;
     auto normalized = path.lexically_normal();
     if (normalized.is_relative()) {

@@ -50,6 +50,9 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
       - name: Verify install target
         run: cmake --install build --prefix "${RUNNER_TEMP}/retrowave-stage"
 
@@ -61,3 +64,6 @@ jobs:
           set -e
           test "${status}" -eq 1
           printf '%s\n' "${output}" | grep -F "No supported audio files were found."
+
+      - name: Smoke test local TUI playback lifecycle
+        run: scripts/smoke/local-playback.sh

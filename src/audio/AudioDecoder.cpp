@@ -1,11 +1,13 @@
 #include "audio/AudioDecoder.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 extern "C" {
@@ -77,6 +79,100 @@ std::string metadataValue(AVDictionary* metadata, const char* key) {
         return {};
     }
     return entry->value;
+}
+
+std::string normalizedMetadataKey(std::string_view key) {
+    std::string normalized;
+    normalized.reserve(key.size());
+    for (const unsigned char symbol : key) {
+        if (symbol == '_' || symbol == '-' || std::isspace(symbol)) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::tolower(symbol)));
+    }
+    return normalized;
+}
+
+bool isLyricsMetadataKey(std::string_view key) {
+    const auto normalized = normalizedMetadataKey(key);
+    return normalized == "lyrics" ||
+        normalized == "lyric" ||
+        normalized == "syncedlyrics" ||
+        normalized == "unsyncedlyrics" ||
+        normalized == "uslt" ||
+        normalized == "sylt" ||
+        normalized == "lyr" ||
+        normalized == "lyricsunsynced" ||
+        normalized == "lyricssynced" ||
+        normalized == "text";
+}
+
+std::string lyricsFromMetadata(AVDictionary* metadata) {
+    if (metadata == nullptr) {
+        return {};
+    }
+
+    // First pass: prefer synced lyrics over unsynced
+    AVDictionaryEntry* entry = nullptr;
+    std::string unsyncedCandidate;
+    while ((entry = av_dict_get(metadata, "", entry, AV_DICT_IGNORE_SUFFIX)) != nullptr) {
+        if (entry->key == nullptr || entry->value == nullptr || entry->value[0] == '\0') {
+            continue;
+        }
+
+        if (!isLyricsMetadataKey(entry->key)) {
+            continue;
+        }
+
+        const auto normalized = normalizedMetadataKey(entry->key);
+        if (normalized == "syncedlyrics" || normalized == "sylt" || normalized == "lyricssynced") {
+            return entry->value;
+        }
+        if (unsyncedCandidate.empty()) {
+            unsyncedCandidate = entry->value;
+        }
+    }
+    return unsyncedCandidate;
+}
+
+std::string extractEmbeddedLyrics(const AVFormatContext* formatContext, const AVStream* audioStream) {
+    // Check format-level metadata first
+    if (formatContext != nullptr) {
+        if (auto lyrics = lyricsFromMetadata(formatContext->metadata); !lyrics.empty()) {
+            return lyrics;
+        }
+    }
+
+    // Check audio stream metadata
+    if (audioStream != nullptr) {
+        if (auto lyrics = lyricsFromMetadata(audioStream->metadata); !lyrics.empty()) {
+            return lyrics;
+        }
+    }
+
+    // Search all other streams for lyrics metadata (some formats store lyrics in separate streams)
+    if (formatContext != nullptr) {
+        for (unsigned int i = 0; i < formatContext->nb_streams; ++i) {
+            const AVStream* stream = formatContext->streams[i];
+            if (stream == audioStream) {
+                continue;
+            }
+            if (auto lyrics = lyricsFromMetadata(stream->metadata); !lyrics.empty()) {
+                return lyrics;
+            }
+        }
+    }
+
+    return {};
+}
+
+std::string titleFromUrl(const std::string& url) {
+    const auto withoutQuery = url.substr(0, url.find_first_of("?#"));
+    const auto slash = withoutQuery.find_last_of('/');
+    if (slash != std::string::npos && slash + 1 < withoutQuery.size()) {
+        return withoutQuery.substr(slash + 1);
+    }
+    return url;
 }
 
 AlbumArt convertFrameToAlbumArt(const AVFrame* frame) {
@@ -180,7 +276,10 @@ std::shared_ptr<const AlbumArt> loadAlbumArtFromFile(const std::filesystem::path
     return nullptr;
 }
 
-std::shared_ptr<const AlbumArt> extractAlbumArt(AVFormatContext* formatContext, const std::filesystem::path& audioPath) {
+std::shared_ptr<const AlbumArt> extractAlbumArt(
+    AVFormatContext* formatContext,
+    const std::filesystem::path& audioPath,
+    bool allowLocalFallback) {
     for (unsigned int streamIndex = 0; streamIndex < formatContext->nb_streams; ++streamIndex) {
         AVStream* stream = formatContext->streams[streamIndex];
         if ((stream->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
@@ -190,6 +289,10 @@ std::shared_ptr<const AlbumArt> extractAlbumArt(AVFormatContext* formatContext, 
         if (auto art = decodeStillImage(formatContext, static_cast<int>(streamIndex), &stream->attached_pic)) {
             return art;
         }
+    }
+
+    if (!allowLocalFallback) {
+        return nullptr;
     }
 
     static const std::vector<std::string> kCoverNames = {
@@ -214,10 +317,15 @@ std::shared_ptr<const AlbumArt> extractAlbumArt(AVFormatContext* formatContext, 
 
 TrackMetadata scanTrackMetadata(AVFormatContext* formatContext,
                                const AVStream* audioStream,
-                               const std::filesystem::path& path) {
+                               const std::filesystem::path& path,
+                               const std::string& source,
+                               bool remote,
+                               const std::string& titleHint) {
     TrackMetadata metadata;
     metadata.path = path;
-    metadata.title = path.stem().string();
+    metadata.source = source;
+    metadata.remote = remote;
+    metadata.title = remote && !titleHint.empty() ? titleHint : (remote ? titleFromUrl(source) : path.stem().string());
     metadata.artist = metadataValue(formatContext->metadata, "artist");
     metadata.album = metadataValue(formatContext->metadata, "album");
 
@@ -226,22 +334,41 @@ TrackMetadata scanTrackMetadata(AVFormatContext* formatContext,
         metadata.title = title;
     }
 
-    LyricsLoader lyricsLoader;
-    metadata.albumArt = extractAlbumArt(formatContext, path);
-    metadata.lyrics = std::make_shared<LyricsData>(lyricsLoader.loadForTrack(path));
     metadata.durationSeconds = inferDurationSeconds(formatContext, audioStream);
+    metadata.live = remote && metadata.durationSeconds <= 0.0;
+    metadata.albumArt = extractAlbumArt(formatContext, path, !remote);
+    if (remote) {
+        auto lyrics = std::make_shared<LyricsData>();
+        lyrics->message = "Lyrics are unavailable for remote streams.";
+        metadata.lyrics = lyrics;
+        metadata.lyricsResolved = true;
+    } else {
+        metadata.embeddedLyricsScratch = extractEmbeddedLyrics(formatContext, audioStream);
+        constexpr std::size_t kMaxEmbeddedLyricsBytes = 512 * 1024;
+        if (metadata.embeddedLyricsScratch.size() > kMaxEmbeddedLyricsBytes) {
+            metadata.embeddedLyricsScratch.resize(kMaxEmbeddedLyricsBytes);
+        }
+        auto lyrics = std::make_shared<LyricsData>();
+        lyrics->message = "Could not find .lrc lyrics for this track.";
+        metadata.lyrics = lyrics;
+    }
     metadata.waveform = placeholderWaveform(metadata.durationSeconds);
     return metadata;
 }
 
 }  // namespace
 
-DecodedTrack AudioDecoder::decode(const std::filesystem::path& path) const {
+namespace {
+
+DecodedTrack decodeInput(
+    const std::string& input,
+    const std::filesystem::path& path,
+    bool remote,
+    const std::string& titleHint) {
     AVFormatContext* rawFormatContext = nullptr;
-    const std::string pathString = path.string();
-    const int openResult = avformat_open_input(&rawFormatContext, pathString.c_str(), nullptr, nullptr);
+    const int openResult = avformat_open_input(&rawFormatContext, input.c_str(), nullptr, nullptr);
     if (openResult < 0) {
-        throw std::runtime_error("Cannot open file: " + ffmpegError(openResult));
+        throw std::runtime_error(std::string(remote ? "Cannot open remote stream: " : "Cannot open file: ") + ffmpegError(openResult));
     }
 
     FormatContextPtr formatContext(rawFormatContext);
@@ -258,8 +385,36 @@ DecodedTrack AudioDecoder::decode(const std::filesystem::path& path) const {
 
     AVStream* stream = formatContext->streams[audioStreamIndex];
     DecodedTrack track;
-    track.metadata = scanTrackMetadata(formatContext.get(), stream, path);
+    track.metadata = scanTrackMetadata(formatContext.get(), stream, path, input, remote, titleHint);
     return track;
+}
+
+}  // namespace
+
+DecodedTrack AudioDecoder::decode(const std::filesystem::path& path) const {
+    return decodeInput(path.string(), path, false, {});
+}
+
+DecodedTrack AudioDecoder::decodeUrl(const std::string& url, const std::string& titleHint) const {
+    return decodeInput(url, std::filesystem::path(url), true, titleHint);
+}
+
+TrackMetadata AudioDecoder::probeLocalMetadata(
+    AVFormatContext* formatContext,
+    int audioStreamIndex,
+    const std::filesystem::path& path) const {
+    if (formatContext == nullptr || audioStreamIndex < 0 ||
+        static_cast<unsigned int>(audioStreamIndex) >= formatContext->nb_streams) {
+        throw std::runtime_error("Cannot read metadata from an invalid audio stream.");
+    }
+
+    return scanTrackMetadata(
+        formatContext,
+        formatContext->streams[audioStreamIndex],
+        path,
+        path.string(),
+        false,
+        {});
 }
 
 }  // namespace retrowave

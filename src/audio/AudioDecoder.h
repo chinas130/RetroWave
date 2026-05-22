@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+struct AVFormatContext;
+
 namespace retrowave {
 
 struct AlbumArt {
@@ -22,6 +24,9 @@ struct AlbumArt {
 
 struct TrackMetadata {
     std::filesystem::path path;
+    std::string source;
+    bool remote = false;
+    bool live = false;
     std::string title;
     std::string artist;
     std::string album;
@@ -29,6 +34,8 @@ struct TrackMetadata {
     std::vector<float> waveform;
     std::shared_ptr<const AlbumArt> albumArt;
     std::shared_ptr<const LyricsData> lyrics;
+    std::string embeddedLyricsScratch;
+    bool lyricsResolved = false;
 };
 
 struct DecodedTrack {
@@ -38,6 +45,11 @@ struct DecodedTrack {
 class AudioDecoder {
   public:
     [[nodiscard]] DecodedTrack decode(const std::filesystem::path& path) const;
+    [[nodiscard]] DecodedTrack decodeUrl(const std::string& url, const std::string& titleHint = {}) const;
+    [[nodiscard]] TrackMetadata probeLocalMetadata(
+        AVFormatContext* formatContext,
+        int audioStreamIndex,
+        const std::filesystem::path& path) const;
 };
 
 }  // namespace retrowave
