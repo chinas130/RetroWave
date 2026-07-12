@@ -75,6 +75,55 @@ if(BUILD_TESTING)
     target_include_directories(settings_store_test PRIVATE src)
     target_compile_options(settings_store_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME settings_store_test COMMAND settings_store_test)
+
+    add_executable(playlist_test
+        tests/playlist_test.cpp
+        src/core/Playlist.cpp
+    )
+    target_include_directories(playlist_test PRIVATE src)
+    target_link_libraries(playlist_test PRIVATE PkgConfig::FFMPEG)
+    target_compile_options(playlist_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME playlist_test COMMAND playlist_test)
+
+    add_executable(seek_test
+        tests/seek_test.cpp
+        src/audio/AudioRingBuffer.cpp
+        src/audio/AudioStreamDecoder.cpp
+        src/audio/AudioDecoder.cpp
+        src/audio/ExternalProcess.cpp
+        src/audio/MetadataCache.cpp
+        src/audio/WaveformCache.cpp
+        src/audio/PlaybackEngine.cpp
+        src/audio/YtDlpResolver.cpp
+        src/core/Playlist.cpp
+        src/core/Lyrics.cpp
+        src/core/Settings.cpp
+        ${AUDIO_OUTPUT_SOURCES}
+    )
+    target_include_directories(seek_test PRIVATE src)
+    target_link_libraries(seek_test PRIVATE PkgConfig::FFMPEG ${PLATFORM_LIBS})
+    target_compile_options(seek_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME seek_test COMMAND seek_test)
+
+    add_executable(playback_engine_test
+        tests/playback_engine_test.cpp
+        src/audio/AudioRingBuffer.cpp
+        src/audio/AudioStreamDecoder.cpp
+        src/audio/AudioDecoder.cpp
+        src/audio/ExternalProcess.cpp
+        src/audio/MetadataCache.cpp
+        src/audio/WaveformCache.cpp
+        src/audio/PlaybackEngine.cpp
+        src/audio/YtDlpResolver.cpp
+        src/core/Playlist.cpp
+        src/core/Lyrics.cpp
+        src/core/Settings.cpp
+        ${AUDIO_OUTPUT_SOURCES}
+    )
+    target_include_directories(playback_engine_test PRIVATE src)
+    target_link_libraries(playback_engine_test PRIVATE PkgConfig::FFMPEG ${PLATFORM_LIBS})
+    target_compile_options(playback_engine_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME playback_engine_test COMMAND playback_engine_test)
 endif()
 
 install(TARGETS retrowave

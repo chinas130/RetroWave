@@ -74,6 +74,7 @@ class PlaybackEngine {
     void togglePause();
     void next();
     void previous();
+    bool seek(double seconds);
     void adjustVolume(float delta);
     void setVolume(float value);
     void setRepeatMode(RepeatMode mode);
@@ -135,6 +136,7 @@ class PlaybackEngine {
     std::atomic<std::size_t> loadingIndex_{0};
     std::atomic<std::uint64_t> loadGeneration_{0};
     std::atomic<bool> stopDecoder_{false};
+    std::atomic<bool> decoderThreadActive_{false};
     std::atomic<bool> stopLoader_{false};
     std::atomic<PlaybackState> state_{PlaybackState::Idle};
     std::atomic<bool> currentRemote_{false};

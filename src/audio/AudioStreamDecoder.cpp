@@ -200,6 +200,10 @@ void AudioStreamDecoder::openInput(const std::string& input, const std::string& 
         throw std::runtime_error("Cannot initialize streaming resampler: " + ffmpegError(swrInitResult));
     }
 
+    originalInput_ = input;
+    originalLabel_ = label;
+    isConverted_ = false;
+
     packet_ = av_packet_alloc();
     frame_ = av_frame_alloc();
     if (packet_ == nullptr || frame_ == nullptr) {
@@ -260,10 +264,93 @@ void AudioStreamDecoder::openConvertedInput(const std::string& input, const std:
         throw std::runtime_error("Cannot start ffmpeg converter for " + label);
     }
 
+    originalInput_ = input;
+    originalLabel_ = label;
+    isConverted_ = true;
+
     eof_ = false;
     readEof_ = false;
     flushSent_ = false;
     clearPendingSamples();
+}
+
+bool AudioStreamDecoder::seekSeconds(double seconds) {
+    if (seconds < 0.0) {
+        seconds = 0.0;
+    }
+
+    clearPendingSamples();
+
+    if (isConverted_) {
+        // Restart the ffmpeg pipe with -ss for seeking
+        std::string seekInput = originalInput_;
+        double seekDuration = durationSeconds_;
+
+        converterProcess_.terminate();
+
+        const std::vector<std::string> args = {
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            std::to_string(seconds),
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls,crypto,pipe,data",
+            "-user_agent",
+            "RetroWave/0.1",
+            "-i",
+            seekInput,
+            "-vn",
+            "-f",
+            "s16le",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "pipe:1",
+        };
+
+        if (!converterProcess_.startStdout(args)) {
+            return false;
+        }
+
+        durationSeconds_ = seekDuration;
+        eof_ = false;
+        readEof_ = false;
+        flushSent_ = false;
+        clearPendingSamples();
+        return true;
+    }
+
+    if (formatContext_ == nullptr || audioStreamIndex_ < 0) {
+        return false;
+    }
+
+    const double timeBase = av_q2d(formatContext_->streams[audioStreamIndex_]->time_base);
+    if (timeBase <= 0.0) {
+        return false;
+    }
+
+    const int64_t timestamp = static_cast<int64_t>(seconds / timeBase);
+    const int seekResult = av_seek_frame(formatContext_, audioStreamIndex_, timestamp, AVSEEK_FLAG_ANY);
+    if (seekResult < 0) {
+        return false;
+    }
+
+    avcodec_flush_buffers(codecContext_);
+    readEof_ = false;
+    flushSent_ = false;
+    eof_ = false;
+    clearPendingSamples();
+    return true;
 }
 
 void AudioStreamDecoder::requestStop() {

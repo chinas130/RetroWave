@@ -28,6 +28,7 @@ class AudioStreamDecoder {
 
     void open(const std::filesystem::path& path);
     void openUrl(const std::string& url);
+    bool seekSeconds(double seconds);
     void requestStop();
     void close();
 
@@ -59,6 +60,9 @@ class AudioStreamDecoder {
     bool readEof_ = false;
     bool flushSent_ = false;
     double durationSeconds_ = 0.0;
+    std::string originalInput_;
+    std::string originalLabel_;
+    bool isConverted_ = false;
     std::vector<std::int16_t> pendingSamples_;
     std::size_t pendingOffset_ = 0;
 };

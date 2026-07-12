@@ -20,13 +20,9 @@ constexpr std::size_t kStreamBufferFrames = static_cast<std::size_t>(AudioOutput
 constexpr std::size_t kDecoderChunkFrames = 2048;
 constexpr auto kDecoderSleep = std::chrono::milliseconds(12);
 
-float clamp(float value, float minimum, float maximum) {
-    return std::max(minimum, std::min(maximum, value));
-}
-
 std::int16_t applyGain(std::int16_t sample, float gain) {
     const float scaled = static_cast<float>(sample) * gain;
-    const float clamped = clamp(scaled, -kInt16Scale, kInt16Scale);
+    const float clamped = std::clamp(scaled, -kInt16Scale, kInt16Scale);
     return static_cast<std::int16_t>(std::lrint(clamped));
 }
 
@@ -385,6 +381,10 @@ void PlaybackEngine::loadIndex(std::size_t index, std::uint64_t generation) {
             streamDecoder_ = std::move(streamDecoder);
         }
 
+        // Wait for any previous decoder thread to fully exit before starting a new one
+        while (decoderThreadActive_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
         stopDecoder_.store(false);
         decoderThread_ = std::thread([this]() { decoderLoop(); });
         setState(PlaybackState::Playing);
@@ -430,11 +430,75 @@ void PlaybackEngine::previous() {
 }
 
 void PlaybackEngine::adjustVolume(float delta) {
-    volume_.store(clamp(volume_.load() + delta, 0.0F, 1.2F));
+    volume_.store(std::clamp(volume_.load() + delta, 0.0F, 1.2F));
+}
+
+bool PlaybackEngine::seek(double seconds) {
+    // Stop the decoder thread to prevent concurrent access to streamDecoder_
+    stopDecoder_.store(true);
+    {
+        std::lock_guard lock(mutex_);
+        if (streamDecoder_) {
+            streamDecoder_->requestStop();
+        }
+    }
+
+    if (decoderThread_.joinable()) {
+        decoderThread_.join();
+    }
+
+    // Wait for decoderLoop to fully exit and mark itself inactive
+    while (decoderThreadActive_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    std::lock_guard lock(mutex_);
+    if (!currentTrack_ || currentTrack_->metadata.remote || currentTrack_->metadata.live) {
+        while (decoderThreadActive_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        stopDecoder_.store(false);
+        decoderThread_ = std::thread([this]() { decoderLoop(); });
+        return false;
+    }
+    if (streamDecoder_ == nullptr) {
+        while (decoderThreadActive_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        stopDecoder_.store(false);
+        decoderThread_ = std::thread([this]() { decoderLoop(); });
+        return false;
+    }
+
+    const double clamped = std::clamp(seconds, 0.0, currentTrack_->metadata.durationSeconds);
+    if (!streamDecoder_->seekSeconds(clamped)) {
+        while (decoderThreadActive_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        stopDecoder_.store(false);
+        decoderThread_ = std::thread([this]() { decoderLoop(); });
+        return false;
+    }
+
+    ringBuffer_.clear();
+    ringBuffer_.clearEof();
+    playbackFrame_.store(static_cast<std::size_t>(clamped * AudioOutput::sampleRate()));
+    trackEnded_.store(false);
+    pendingAdvance_.store(false);
+    level_.store(0.0F);
+    setState(PlaybackState::Playing);
+
+    // Wait for decoderLoop to fully exit before restarting
+    while (decoderThreadActive_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    stopDecoder_.store(false);
+    decoderThread_ = std::thread([this]() { decoderLoop(); });
+    return true;
 }
 
 void PlaybackEngine::setVolume(float value) {
-    volume_.store(clamp(value, 0.0F, 1.2F));
+    volume_.store(std::clamp(value, 0.0F, 1.2F));
 }
 
 void PlaybackEngine::setRepeatMode(RepeatMode mode) {
@@ -729,6 +793,7 @@ std::size_t PlaybackEngine::computePreviousIndex(std::size_t currentIndex) {
 }
 
 void PlaybackEngine::decoderLoop() {
+    decoderThreadActive_.store(true, std::memory_order_release);
     std::vector<std::int16_t> decodeBuffer(kDecoderChunkFrames * 2, 0);
 
     while (!stopDecoder_.load()) {
@@ -739,6 +804,7 @@ void PlaybackEngine::decoderLoop() {
         }
 
         if (streamDecoder == nullptr) {
+            decoderThreadActive_.store(false, std::memory_order_release);
             return;
         }
 
@@ -757,6 +823,7 @@ void PlaybackEngine::decoderLoop() {
                         : "Remote track ended or produced no audio.";
                 }
                 ringBuffer_.markEof();
+                decoderThreadActive_.store(false, std::memory_order_release);
                 return;
             }
 
@@ -775,9 +842,11 @@ void PlaybackEngine::decoderLoop() {
             std::lock_guard lock(mutex_);
             lastError_ = error.what();
             ringBuffer_.markEof();
+            decoderThreadActive_.store(false, std::memory_order_release);
             return;
         }
     }
+    decoderThreadActive_.store(false, std::memory_order_release);
 }
 
 std::size_t PlaybackEngine::renderFrames(std::int16_t* destination, std::size_t frames) {

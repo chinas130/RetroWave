@@ -468,6 +468,10 @@ int TerminalUI::run() {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
+    mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, nullptr);
+    mouseinterval(0);
+    printf("\033[?1003h");
+    fflush(stdout);
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -490,9 +494,61 @@ int TerminalUI::run() {
         const auto beforeInput = std::chrono::steady_clock::now();
         timeout(computePollTimeout(snapshot, beforeInput));
         const int key = getch();
-        if (key != ERR) {
+    if (key != ERR) {
+        // Check for SGR mouse scroll events that ncurses doesn't decode on macOS
+        if (key == KEY_MOUSE) {
+            // Try ncurses mouse handling first
+            handleInput(key);
+        } else if (key == 27) {
+            // Possible start of SGR sequence — peek next chars
+            timeout(0);
+            const int next1 = getch();
+            if (next1 == '[') {
+                timeout(0);
+                const int next2 = getch();
+                if (next2 == '<') {
+                    // Read SGR mouse: \033[<X;Y;M
+                    std::string seq;
+                    timeout(0);
+                    int ch;
+                    while ((ch = getch()) != ERR && ch != 'M' && ch != 'm') {
+                        if ((ch >= '0' && ch <= '9') || ch == ';') {
+                            seq += static_cast<char>(ch);
+                        }
+                    }
+                    if (ch == 'M') {
+                        // Parse "btn;x;y"
+                        int btn = 0, x = 0, y = 0;
+                        if (std::sscanf(seq.c_str(), "%d;%d;%d", &btn, &x, &y) >= 1) {
+                            if ((btn & 0x40) == 0) {
+                                // Press event (bit 6 = 0)
+                                if (btn == 0 || btn == 1 || btn == 2) {
+                                    // Regular click — ignore, ncurses handles this
+                                }
+                            }
+                            if (btn == 64) { // wheel up (64-65)
+                                if (selectedIndex_ > 0) {
+                                    selectedIndex_ = selectedIndex_ > 2 ? selectedIndex_ - 2 : 0;
+                                }
+                            } else if (btn == 65) { // wheel down
+                                if (selectedIndex_ + 1 < engine_.playlist().size()) {
+                                    selectedIndex_ = std::min(selectedIndex_ + 2, engine_.playlist().size() - 1);
+                                }
+                            }
+                        }
+                    }
+                } else if (next2 != ERR) {
+                    ungetch(next2);
+                }
+            } else if (next1 != ERR) {
+                ungetch(next1);
+                // If it's a standalone Esc, treat normally
+                handleInput(key);
+            }
+        } else {
             handleInput(key);
         }
+    }
 
         engine_.update();
         snapshot = engine_.snapshot();
@@ -508,6 +564,8 @@ int TerminalUI::run() {
 
     flushSettingsFromEngine();
     endwin();
+    printf("\033[?1003l");
+    fflush(stdout);
     return 0;
 }
 
@@ -534,8 +592,8 @@ TerminalUI::Layout TerminalUI::computeLayout(int rows, int cols) const {
     const int artWidth = std::clamp(albumWidth / 3, 18, 28);
     const int infoLeft = albumLeft + artWidth + 2;
     const int infoWidth = std::max(12, albumWidth - artWidth - 2);
-    const int timeHeight = albumHeight >= 6 ? 2 : 1;
-    const int gapHeight = albumHeight >= 8 ? 1 : 0;
+    const int timeHeight = albumHeight >= 10 ? 4 : (albumHeight >= 2 ? 2 : 1);
+    const int gapHeight = albumHeight >= 6 ? 1 : 0;
     const int metaHeight = std::max(1, albumHeight - timeHeight - gapHeight);
 
     layout.cover = {albumTop, albumLeft, albumHeight, artWidth};
@@ -597,13 +655,13 @@ void TerminalUI::drawHeader(const Rect& rect, const PlaybackSnapshot& snapshot) 
     const std::string repeatText = std::string("Repeat: ") + repeatModeLabel(snapshot.repeatMode);
     const int shuffleLeft = rect.left + rect.width - static_cast<int>(shuffleText.size()) - 2;
     const int repeatLeft = shuffleLeft - static_cast<int>(repeatText.size()) - 3;
-    
+
     if (repeatLeft > rect.left + 54) {
         attron(A_BOLD);
         mvprintw(rect.top, repeatLeft, "%s", repeatText.c_str());
         attroff(A_BOLD);
     }
-    
+
     if (shuffleLeft > rect.left + 54) {
         attron(A_BOLD);
         mvprintw(rect.top, shuffleLeft, "%s", shuffleText.c_str());
@@ -701,8 +759,7 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_cloc
     } else {
         const int activeLyricIndex =
             snapshot.lyrics ? currentLyricIndex(*snapshot.lyrics, snapshot.positionSeconds) : -1;
-        
-        // If we have timed lyrics, we need frequent redraws for the progress bar and word highlighting
+
         bool timedRedrawDue = false;
         if (snapshot.lyrics && snapshot.lyrics->timed && activeLyricIndex >= 0) {
             timedRedrawDue = lastVisualizerRedraw_.time_since_epoch().count() == 0 ||
@@ -712,7 +769,7 @@ void TerminalUI::draw(const PlaybackSnapshot& snapshot, std::chrono::steady_cloc
         detailDirty = detailDirty || snapshot.path != lastTrackPath_ || activeLyricIndex != lastActiveLyricIndex_ || timedRedrawDue;
         lastActiveLyricIndex_ = activeLyricIndex;
         if (detailDirty) {
-            lastVisualizerRedraw_ = now; // reuse visualizer timer for lyrics too
+            lastVisualizerRedraw_ = now;
         }
     }
 
@@ -965,13 +1022,89 @@ void TerminalUI::drawTimePane(int top, int left, int height, int width, const Pl
         mvhline(top + row, left, ' ', width);
     }
 
+    if (height >= 4) {
+        // Four-row layout: label, double-height bar, time text
+        attron(A_DIM);
+        drawTextLine(top, left, width, "Time");
+        attroff(A_DIM);
+
+        const int barWidth = std::max(4, width - 2);
+        if (snapshot.hasTrack && snapshot.durationSeconds > 0.0 && !snapshot.live) {
+            const double fraction = std::clamp(snapshot.positionSeconds / snapshot.durationSeconds, 0.0, 1.0);
+            const int filled = static_cast<int>(std::round(fraction * static_cast<double>(barWidth)));
+            // Row 1: top half of double-thick bar with arrowhead
+            mvaddch(top + 1, left, '[');
+            mvaddch(top + 1, left + barWidth + 1, ']');
+            for (int i = 0; i < barWidth; ++i) {
+                if (i < filled) {
+                    mvaddch(top + 1, left + 1 + i, i == filled - 1 && filled < barWidth ? '>' : '=');
+                } else {
+                    mvaddch(top + 1, left + 1 + i, '-');
+                }
+            }
+            // Row 2: bottom half of double-thick bar (same, no arrowhead)
+            mvaddch(top + 2, left, '[');
+            mvaddch(top + 2, left + barWidth + 1, ']');
+            for (int i = 0; i < barWidth; ++i) {
+                if (i < filled) {
+                    mvaddch(top + 2, left + 1 + i, '=');
+                } else {
+                    mvaddch(top + 2, left + 1 + i, '-');
+                }
+            }
+            // Row 3: time text
+            attron(A_BOLD);
+            drawTextLine(top + 3, left, width, formatTime(snapshot.positionSeconds) + " / " + formatDuration(snapshot.durationSeconds, snapshot.live));
+            attroff(A_BOLD);
+        } else if (snapshot.live) {
+            drawTextLine(top + 1, left, width, "[ LIVE (seek unavailable) ]");
+            drawTextLine(top + 2, left, width, "");
+            if (height >= 4) {
+                attron(A_BOLD);
+                drawTextLine(top + 3, left, width, formatTime(snapshot.positionSeconds) + " / " + formatDuration(snapshot.durationSeconds, snapshot.live));
+                attroff(A_BOLD);
+            }
+        } else {
+            drawTextLine(top + 1, left, width, "[ no track ]");
+            drawTextLine(top + 2, left, width, "");
+            if (height >= 4) {
+                attron(A_BOLD);
+                drawTextLine(top + 3, left, width, formatTime(snapshot.positionSeconds) + " / " + formatDuration(snapshot.durationSeconds, snapshot.live));
+                attroff(A_BOLD);
+            }
+        }
+        return;
+    }
+
     if (height >= 2) {
         attron(A_DIM);
         drawTextLine(top, left, width, "Time");
         attroff(A_DIM);
-        attron(A_BOLD);
-        drawTextLine(top + 1, left, width, formatTime(snapshot.positionSeconds) + " / " + formatDuration(snapshot.durationSeconds, snapshot.live));
-        attroff(A_BOLD);
+
+        const int barWidth = std::max(4, width - 2);
+        if (snapshot.hasTrack && snapshot.durationSeconds > 0.0 && !snapshot.live) {
+            const double fraction = std::clamp(snapshot.positionSeconds / snapshot.durationSeconds, 0.0, 1.0);
+            const int filled = static_cast<int>(std::round(fraction * static_cast<double>(barWidth)));
+            mvaddch(top + 1, left, '[');
+            mvaddch(top + 1, left + barWidth + 1, ']');
+            for (int i = 0; i < barWidth; ++i) {
+                if (i < filled) {
+                    mvaddch(top + 1, left + 1 + i, i == filled - 1 && filled < barWidth ? '>' : '=');
+                } else {
+                    mvaddch(top + 1, left + 1 + i, '-');
+                }
+            }
+        } else if (snapshot.live) {
+            drawTextLine(top + 1, left, width, "[ LIVE (seek unavailable) ]");
+        } else {
+            drawTextLine(top + 1, left, width, "[ no track ]");
+        }
+
+        if (height >= 3) {
+            attron(A_BOLD);
+            drawTextLine(top + 2, left, width, formatTime(snapshot.positionSeconds) + " / " + formatDuration(snapshot.durationSeconds, snapshot.live));
+            attroff(A_BOLD);
+        }
         return;
     }
 
@@ -1094,11 +1227,9 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
         const int distFromActive = isPast ? (activeIndex - lineIndex) : 0;
 
         if (isActive && snapshot.lyrics->enhanced && lyric.hasWordSync()) {
-            // Enhanced LRC: karaoke word-by-word rendering
             const int segIdx = activeSegmentIndex(lyric, snapshot.positionSeconds);
             const std::string indicator = "▸ " + prefix;
 
-            // Draw the indicator
             if (has_colors()) {
                 attron(COLOR_PAIR(3) | A_BOLD);
             } else {
@@ -1111,7 +1242,6 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
                 attroff(A_BOLD);
             }
 
-            // Draw word segments with progressive highlighting
             int col = left + static_cast<int>(indicator.size());
             const int maxCol = left + width;
             for (int si = 0; si < static_cast<int>(lyric.segments.size()) && col < maxCol; ++si) {
@@ -1158,7 +1288,6 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
                 }
             }
         } else if (isActive) {
-            // Standard synced: highlight the full active line with progress indicator
             const std::string indicator = "▸ ";
             const std::string rendered = trimText(indicator + prefix + lyric.text, width);
 
@@ -1174,7 +1303,6 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
                 attroff(A_BOLD);
             }
 
-            // Draw a progress bar under the active line if there's room
             if (snapshot.lyrics->timed && row + 1 < bodyRows) {
                 const double progress = lineProgress(lyric, snapshot.positionSeconds);
                 const int barWidth = std::max(0, width - 2);
@@ -1189,11 +1317,9 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
                     attroff(COLOR_PAIR(4));
                 }
 
-                // Skip the progress bar row in the lyric line loop
                 ++row;
             }
         } else if (isNext) {
-            // Next line: subtle highlight to preview what's coming
             const std::string rendered = trimText("  " + prefix + lyric.text, width);
             if (has_colors()) {
                 attron(COLOR_PAIR(1));
@@ -1203,7 +1329,6 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
                 attroff(COLOR_PAIR(1));
             }
         } else if (isPast) {
-            // Past lines: gradient dim — recently past lines are less dim
             const std::string rendered = trimText("  " + prefix + lyric.text, width);
             attron(A_DIM);
             if (distFromActive <= 2 && has_colors()) {
@@ -1215,13 +1340,11 @@ void TerminalUI::drawLyrics(int top, int left, int height, int width, const Play
             }
             attroff(A_DIM);
         } else {
-            // Future lines (beyond next): normal dim
             const std::string rendered = trimText("  " + prefix + lyric.text, width);
             drawTextLine(top + row, left, width, rendered);
         }
     }
 
-    // Status line at bottom
     std::string statusText = snapshot.lyrics->message;
     if (snapshot.lyrics->timed && activeIndex >= 0) {
         const auto& activeLine = snapshot.lyrics->lines[static_cast<std::size_t>(activeIndex)];
@@ -1505,6 +1628,24 @@ void TerminalUI::handleInput(int key) {
             engine_.previous();
             selectedIndex_ = engine_.snapshot().currentIndex;
             return;
+        case KEY_PPAGE: {
+            const auto snap = engine_.snapshot();
+            engine_.seek(snap.positionSeconds - 10.0);
+            return;
+        }
+        case KEY_NPAGE: {
+            const auto snap = engine_.snapshot();
+            engine_.seek(snap.positionSeconds + 10.0);
+            return;
+        }
+        case '<':
+        case ',':
+            engine_.seek(engine_.snapshot().positionSeconds - 5.0);
+            return;
+        case '>':
+        case '.':
+            engine_.seek(engine_.snapshot().positionSeconds + 5.0);
+            return;
         case '+':
         case '=':
             engine_.adjustVolume(0.05F);
@@ -1521,6 +1662,57 @@ void TerminalUI::handleInput(int key) {
         case 'T':
             detailMode_ = detailMode_ == DetailMode::Visualizer ? DetailMode::Lyrics : DetailMode::Visualizer;
             return;
+        case KEY_MOUSE: {
+            MEVENT event;
+            if (getmouse(&event) != OK) {
+                return;
+            }
+            if (event.bstate & BUTTON1_CLICKED) {
+                // Playlist click: whole frame area — each row = one track
+                if (event.y >= layout_.playlistFrame.top + 1 &&
+                    event.y < layout_.playlistFrame.top + layout_.playlistFrame.height - 1 &&
+                    event.x >= layout_.playlistFrame.left + 1 &&
+                    event.x < layout_.playlistFrame.left + layout_.playlistFrame.width - 1) {
+                    const int trackCount = static_cast<int>(engine_.playlist().size());
+                    const int contentRows = layout_.playlistFrame.height - 2;
+                    const int clickedRow = event.y - (layout_.playlistFrame.top + 1);
+                    // Map row to track index (with scrolling)
+                    int firstVisible = 0;
+                    if (static_cast<int>(selectedIndex_) >= contentRows) {
+                        firstVisible = static_cast<int>(selectedIndex_) - contentRows + 1;
+                    }
+                    const int trackIndex = std::min(firstVisible + clickedRow, trackCount - 1);
+                    if (trackIndex >= 0 && trackIndex < trackCount) {
+                        selectedIndex_ = static_cast<std::size_t>(trackIndex);
+                        engine_.playIndex(selectedIndex_);
+                    }
+                }
+                if (event.y >= layout_.time.top &&
+                    event.y < layout_.time.top + layout_.time.height &&
+                    event.x >= layout_.time.left &&
+                    event.x < layout_.time.left + layout_.time.width) {
+                    const auto snap = engine_.snapshot();
+                    if (snap.hasTrack && snap.durationSeconds > 0.0 && !snap.live && !snap.remote) {
+                        const double fraction = static_cast<double>(event.x - layout_.time.left) /
+                                                static_cast<double>(layout_.time.width);
+                        engine_.seek(fraction * snap.durationSeconds);
+                    }
+                }
+                if (event.y >= layout_.cover.top &&
+                    event.y < layout_.cover.top + layout_.cover.height &&
+                    event.x >= layout_.cover.left &&
+                    event.x < layout_.cover.left + layout_.cover.width) {
+                    cycleCoverArtMode(1);
+                }
+                if (event.y >= layout_.detailFrame.top &&
+                    event.y < layout_.detailFrame.top + layout_.detailFrame.height &&
+                    event.x >= layout_.detailFrame.left &&
+                    event.x < layout_.detailFrame.left + layout_.detailFrame.width) {
+                    detailMode_ = detailMode_ == DetailMode::Visualizer ? DetailMode::Lyrics : DetailMode::Visualizer;
+                }
+            }
+            return;
+        }
         case 'r':
         case 'R':
             cycleRepeatMode();
