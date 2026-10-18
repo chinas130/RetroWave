@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "audio/YtDlpResolver.h"
 
 #include "audio/ExternalProcess.h"

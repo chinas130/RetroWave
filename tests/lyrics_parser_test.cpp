@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "core/Lyrics.h"
 
 #include <chrono>
@@ -97,6 +100,46 @@ void testMissingFallbackMessage() {
     std::filesystem::remove_all(directory);
 }
 
+void testEdgeCases() {
+    const auto directory = makeTempDir();
+    const auto track = directory / "song.mp3";
+    const auto lrc = directory / "song.lrc";
+    
+    // 1. Unsorted timecodes, negative offset, empty timecodes
+    writeText(
+        lrc,
+        "[offset: -99999]\n"
+        "[02:00.00]Second\n"
+        "[00:10.00]First\n"
+        "[00:15.00]\n"
+    );
+
+    auto lyrics = retrowave::LyricsLoader{}.loadForTrack(track);
+    require(lyrics.found, "should find edge case lyrics");
+    require(lyrics.lines.size() == 3, "should have 3 lines");
+    
+    require(lyrics.lines[0].text == "First", "First line should be sorted first");
+    require(lyrics.lines[1].text == "...", "Empty line should become ...");
+    require(lyrics.lines[2].text == "Second", "Second line should be sorted last");
+    require(lyrics.lines[0].timestampSeconds < 0.0, "Timestamp should go negative with huge offset");
+
+    // 2. Giant file (OOM protection)
+    std::string giantLrc = "[00:00.00]Line\n";
+    for (int i = 0; i < 4000; ++i) {
+        giantLrc += "[00:01.00]More text\n";
+    }
+    while (giantLrc.size() < 600 * 1024) {
+        giantLrc += "[00:02.00]Pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad\n";
+    }
+    
+    writeText(lrc, giantLrc);
+    lyrics = retrowave::LyricsLoader{}.loadForTrack(track);
+    require(lyrics.found, "should parse giant file without crash");
+    require(lyrics.lines.size() <= 3000, "Should not exceed kMaxLyricLines");
+    
+    std::filesystem::remove_all(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -104,6 +147,7 @@ int main() {
         testSidecarLrc();
         testEmbeddedFallback();
         testMissingFallbackMessage();
+        testEdgeCases();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "core/Settings.h"
+#include <toml++/toml.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -81,43 +85,45 @@ const char* shuffleModeName(ShuffleMode mode) {
 
 AppSettings SettingsStore::load() const {
     AppSettings settings;
-
-    std::ifstream input(settingsPath());
-    if (!input.is_open()) {
-        return settings;
-    }
-
-    std::string line;
-    while (std::getline(input, line)) {
-        const auto separator = line.find('=');
-        if (separator == std::string::npos) {
-            continue;
-        }
-
-        const auto key = line.substr(0, separator);
-        const auto value = line.substr(separator + 1);
-
-        if (key == "volume") {
-            try {
-                settings.volume = clampVolume(std::stof(value));
-            } catch (...) {
+    try {
+        toml::table tbl = toml::parse_file(settingsPath().string());
+        if (auto general = tbl["general"].as_table()) {
+            if (auto vol = general->get("volume")) {
+                if (vol->is_number()) {
+                    settings.volume = clampVolume(static_cast<float>(vol->value_or(0.85)));
+                }
             }
-            continue;
+            if (auto cam = general->get("cover_art_mode")) {
+                if (cam->is_string()) {
+                    settings.coverArtMode = parseCoverArtMode(cam->value_or("ascii"));
+                }
+            }
+            if (auto rm = general->get("repeat_mode")) {
+                if (rm->is_string()) {
+                    settings.repeatMode = parseRepeatMode(rm->value_or("off"));
+                }
+            }
+            if (auto sm = general->get("shuffle_mode")) {
+                if (sm->is_string()) {
+                    settings.shuffleMode = parseShuffleMode(sm->value_or("off"));
+                }
+            }
+            if (auto th = general->get("theme")) {
+                if (th->is_string()) {
+                    settings.theme = th->value_or("retrowave");
+                }
+            }
+            if (auto lp = general->get("layout_preset")) {
+                if (lp->is_string()) {
+                    settings.layoutPreset = lp->value_or("default");
+                }
+            }
         }
-
-        if (key == "cover_art_mode") {
-            settings.coverArtMode = parseCoverArtMode(value);
-            continue;
+        if (auto keys = tbl["keys"].as_table()) {
+            settings.keysTable = *keys;
         }
-
-        if (key == "repeat_mode") {
-            settings.repeatMode = parseRepeatMode(value);
-            continue;
-        }
-
-        if (key == "shuffle_mode") {
-            settings.shuffleMode = parseShuffleMode(value);
-        }
+    } catch (const toml::parse_error&) {
+        // Just return defaults if parsing fails or file doesn't exist
     }
 
     return settings;
@@ -128,11 +134,24 @@ bool SettingsStore::save(const AppSettings& settings) const {
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
 
-    std::ostringstream content;
-    content << "volume=" << clampVolume(settings.volume) << '\n';
-    content << "cover_art_mode=" << coverArtModeName(settings.coverArtMode) << '\n';
-    content << "repeat_mode=" << repeatModeName(settings.repeatMode) << '\n';
-    content << "shuffle_mode=" << shuffleModeName(settings.shuffleMode) << '\n';
+    toml::table tbl;
+    try {
+        tbl = toml::parse_file(path.string());
+    } catch (...) {
+        // File might not exist or be invalid, start fresh
+    }
+
+    if (!tbl["general"].is_table()) {
+        tbl.insert_or_assign("general", toml::table{});
+    }
+
+    auto* general = tbl["general"].as_table();
+    general->insert_or_assign("volume", clampVolume(settings.volume));
+    general->insert_or_assign("cover_art_mode", coverArtModeName(settings.coverArtMode));
+    general->insert_or_assign("repeat_mode", repeatModeName(settings.repeatMode));
+    general->insert_or_assign("shuffle_mode", shuffleModeName(settings.shuffleMode));
+    general->insert_or_assign("theme", settings.theme);
+    general->insert_or_assign("layout_preset", settings.layoutPreset);
 
     const auto temporaryPath = path.string() + ".tmp";
     {
@@ -141,20 +160,15 @@ bool SettingsStore::save(const AppSettings& settings) const {
             return false;
         }
 
-        output << content.str();
+        output << tbl;
         if (!output.good()) {
             std::filesystem::remove(temporaryPath, error);
             return false;
         }
+        output.flush();
     }
 
     std::filesystem::rename(temporaryPath, path, error);
-    if (error) {
-        std::filesystem::remove(path, error);
-        error.clear();
-        std::filesystem::rename(temporaryPath, path, error);
-    }
-
     if (error) {
         std::filesystem::remove(temporaryPath, error);
         return false;
@@ -165,14 +179,14 @@ bool SettingsStore::save(const AppSettings& settings) const {
 
 std::filesystem::path SettingsStore::settingsPath() const {
     if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg != nullptr && xdg[0] != '\0') {
-        return std::filesystem::path(xdg) / "retrowave" / "settings.conf";
+        return std::filesystem::path(xdg) / "retrowave" / "config.toml";
     }
 
     if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
-        return std::filesystem::path(home) / ".config" / "retrowave" / "settings.conf";
+        return std::filesystem::path(home) / ".config" / "retrowave" / "config.toml";
     }
 
-    return std::filesystem::current_path() / ".retrowave-settings.conf";
+    return std::filesystem::current_path() / ".retrowave-config.toml";
 }
 
 }  // namespace retrowave

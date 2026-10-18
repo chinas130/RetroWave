@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "core/Lyrics.h"
 
 #include <algorithm>
@@ -147,14 +150,33 @@ std::vector<LyricSegment> parseInlineSegments(const std::string& text) {
 }
 
 bool parseMetadataTag(const std::string& line, std::string& key, std::string& value) {
-    static const std::regex metadataPattern(R"(\[([A-Za-z][A-Za-z0-9_-]*):(.*?)\])");
-    std::smatch match;
-    if (!std::regex_search(line, match, metadataPattern)) {
+    std::string_view view(line);
+    if (view.empty() || view.front() != '[') {
         return false;
     }
 
-    key = toLower(trim(match[1].str()));
-    value = trim(match[2].str());
+    const auto colon = view.find(':');
+    if (colon == std::string_view::npos) {
+        return false;
+    }
+
+    const auto close = view.find(']', colon);
+    if (close == std::string_view::npos) {
+        return false;
+    }
+
+    auto rawKey = view.substr(1, colon - 1);
+    if (rawKey.empty() || !std::isalpha(static_cast<unsigned char>(rawKey.front()))) {
+        return false;
+    }
+    for (char c : rawKey) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+            return false;
+        }
+    }
+
+    key = toLower(trim(std::string(rawKey)));
+    value = trim(std::string(view.substr(colon + 1, close - colon - 1)));
     return !key.empty();
 }
 

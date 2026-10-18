@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "audio/ExternalProcess.h"
 
 #include <array>
@@ -119,14 +122,7 @@ bool ExternalProcess::startStdout(const std::vector<std::string>& args) {
         return false;
     }
 
-    FILE* stream = fdopen(outputPipe[0], "r");
-    if (stream == nullptr) {
-        close(outputPipe[0]);
-        terminateProcessGroup(pid);
-        return false;
-    }
-
-    stdout_ = stream;
+    stdoutFd_ = outputPipe[0];
     pid_ = pid;
     return true;
 }
@@ -139,25 +135,35 @@ std::string ExternalProcess::captureStdout(const std::vector<std::string>& args)
 
     std::string output;
     std::array<char, 4096> buffer{};
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), process.stdoutStream()) != nullptr) {
-        output += buffer.data();
+    while (true) {
+        const ssize_t bytesRead = ::read(process.stdoutFd(), buffer.data(), buffer.size());
+        if (bytesRead > 0) {
+            output.append(buffer.data(), static_cast<std::size_t>(bytesRead));
+        } else if (bytesRead == 0) {
+            break; // EOF
+        } else {
+            if (errno == EINTR) {
+                continue;
+            }
+            break; // Error
+        }
     }
     process.closeStdout();
 
     return process.wait() ? output : std::string{};
 }
 
-FILE* ExternalProcess::stdoutStream() const noexcept {
-    return stdout_;
+int ExternalProcess::stdoutFd() const noexcept {
+    return stdoutFd_;
 }
 
 bool ExternalProcess::active() const noexcept {
-    return pid_ > 0 || stdout_ != nullptr;
+    return pid_ > 0 || stdoutFd_ >= 0;
 }
 
 void ExternalProcess::requestStop() noexcept {
     signalProcessGroup(pid_, SIGTERM);
-    signalProcessGroup(pid_, SIGKILL);
+    closeStdout();
 }
 
 void ExternalProcess::terminate() noexcept {
@@ -178,9 +184,9 @@ bool ExternalProcess::wait() noexcept {
 }
 
 void ExternalProcess::closeStdout() noexcept {
-    if (stdout_ != nullptr) {
-        fclose(stdout_);
-        stdout_ = nullptr;
+    if (stdoutFd_ >= 0) {
+        ::close(stdoutFd_);
+        stdoutFd_ = -1;
     }
 }
 

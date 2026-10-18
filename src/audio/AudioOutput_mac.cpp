@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "audio/AudioOutput.h"
 
 #include <AudioToolbox/AudioToolbox.h>
@@ -16,18 +19,6 @@ constexpr int kChannelCount = 2;
 void checkStatus(OSStatus status, const char* message) {
     if (status != noErr) {
         throw std::runtime_error(std::string(message) + " (OSStatus=" + std::to_string(status) + ")");
-    }
-}
-
-void swapStereoChannels(std::int16_t* samples, std::size_t frames) {
-    if (samples == nullptr) {
-        return;
-    }
-
-    for (std::size_t frame = 0; frame < frames; ++frame) {
-        const auto left = frame * kChannelCount;
-        const auto right = left + 1;
-        std::swap(samples[left], samples[right]);
     }
 }
 
@@ -112,7 +103,6 @@ struct AudioOutput::Impl {
     void fillAndEnqueue(AudioQueueBufferRef buffer) {
         auto* samples = static_cast<std::int16_t*>(buffer->mAudioData);
         const std::size_t framesWritten = render_(samples, AudioOutput::framesPerBuffer());
-        swapStereoChannels(samples, framesWritten);
         const auto bytesWritten = static_cast<std::uint32_t>(
             std::max<std::size_t>(framesWritten, AudioOutput::framesPerBuffer()) * sizeof(std::int16_t) * kChannelCount);
 

@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "audio/AudioRingBuffer.h"
 
 #include <algorithm>
+#include <bit>
 
 namespace retrowave {
 
@@ -11,106 +15,116 @@ AudioRingBuffer::AudioRingBuffer(std::size_t capacityFrames, int channels) {
 }
 
 void AudioRingBuffer::reset(std::size_t capacityFrames, int channels) {
-    std::lock_guard lock(mutex_);
     channels_ = std::max(1, channels);
-    buffer_.assign(capacityFrames * static_cast<std::size_t>(channels_), 0);
-    readFrame_ = 0;
-    writeFrame_ = 0;
-    sizeFrames_ = 0;
-    eof_ = false;
+    capacityFrames_ = std::bit_ceil(capacityFrames);
+    mask_ = capacityFrames_ - 1;
+    buffer_.assign(capacityFrames_ * static_cast<std::size_t>(channels_), 0);
+    readPos_.store(0, std::memory_order_seq_cst);
+    writePos_.store(0, std::memory_order_seq_cst);
+    eof_.store(false, std::memory_order_seq_cst);
 }
 
-void AudioRingBuffer::clear() {
-    std::lock_guard lock(mutex_);
-    readFrame_ = 0;
-    writeFrame_ = 0;
-    sizeFrames_ = 0;
-    eof_ = false;
+void AudioRingBuffer::flush() {
+    const std::size_t currentWrite = writePos_.load(std::memory_order_acquire);
+    readPos_.store(currentWrite, std::memory_order_release);
+    eof_.store(false, std::memory_order_release);
 }
 
 std::size_t AudioRingBuffer::push(const std::int16_t* source, std::size_t frames) {
-    std::lock_guard lock(mutex_);
     if (source == nullptr || frames == 0 || buffer_.empty()) {
         return 0;
     }
 
-    const auto framesToWrite = std::min(frames, capacityFramesLocked() - sizeFrames_);
+    const std::size_t capacity = capacityFrames_;
+    const std::size_t currentWrite = writePos_.load(std::memory_order_relaxed);
+    const std::size_t currentRead = readPos_.load(std::memory_order_acquire);
+
+    const std::size_t diff = currentWrite - currentRead;
+    const std::size_t usedSpace = diff <= capacity ? diff : 0;
+    const std::size_t availableSpace = capacity - usedSpace;
+    const std::size_t framesToWrite = std::min(frames, availableSpace);
+
     if (framesToWrite == 0) {
         return 0;
     }
 
-    for (std::size_t frame = 0; frame < framesToWrite; ++frame) {
-        const auto destinationFrame = (writeFrame_ + frame) % capacityFramesLocked();
-        for (int channel = 0; channel < channels_; ++channel) {
-            buffer_[destinationFrame * static_cast<std::size_t>(channels_) + static_cast<std::size_t>(channel)] =
-                source[frame * static_cast<std::size_t>(channels_) + static_cast<std::size_t>(channel)];
-        }
+    const std::size_t writeIdx = currentWrite & mask_;
+    const std::size_t numChannels = static_cast<std::size_t>(channels_);
+    const std::size_t framesUntilWrap = capacity - writeIdx;
+    
+    if (framesToWrite <= framesUntilWrap) {
+        std::copy_n(source, framesToWrite * numChannels, buffer_.data() + writeIdx * numChannels);
+    } else {
+        std::copy_n(source, framesUntilWrap * numChannels, buffer_.data() + writeIdx * numChannels);
+        std::copy_n(source + framesUntilWrap * numChannels, (framesToWrite - framesUntilWrap) * numChannels, buffer_.data());
     }
 
-    writeFrame_ = (writeFrame_ + framesToWrite) % capacityFramesLocked();
-    sizeFrames_ += framesToWrite;
+    writePos_.store(currentWrite + framesToWrite, std::memory_order_release);
     return framesToWrite;
 }
 
 std::size_t AudioRingBuffer::pop(std::int16_t* destination, std::size_t frames) {
-    std::lock_guard lock(mutex_);
     if (destination == nullptr || frames == 0 || buffer_.empty()) {
         return 0;
     }
 
-    const auto framesToRead = std::min(frames, sizeFrames_);
+    const std::size_t capacity = capacityFrames_;
+    const std::size_t currentRead = readPos_.load(std::memory_order_relaxed);
+    const std::size_t currentWrite = writePos_.load(std::memory_order_acquire);
+
+    const std::size_t diff = currentWrite - currentRead;
+    const std::size_t availableData = diff <= capacity ? diff : 0;
+    const std::size_t framesToRead = std::min(frames, availableData);
+
     if (framesToRead == 0) {
         return 0;
     }
 
-    for (std::size_t frame = 0; frame < framesToRead; ++frame) {
-        const auto sourceFrame = (readFrame_ + frame) % capacityFramesLocked();
-        for (int channel = 0; channel < channels_; ++channel) {
-            destination[frame * static_cast<std::size_t>(channels_) + static_cast<std::size_t>(channel)] =
-                buffer_[sourceFrame * static_cast<std::size_t>(channels_) + static_cast<std::size_t>(channel)];
-        }
+    const std::size_t readIdx = currentRead & mask_;
+    const std::size_t numChannels = static_cast<std::size_t>(channels_);
+    const std::size_t framesUntilWrap = capacity - readIdx;
+
+    if (framesToRead <= framesUntilWrap) {
+        std::copy_n(buffer_.data() + readIdx * numChannels, framesToRead * numChannels, destination);
+    } else {
+        std::copy_n(buffer_.data() + readIdx * numChannels, framesUntilWrap * numChannels, destination);
+        std::copy_n(buffer_.data(), (framesToRead - framesUntilWrap) * numChannels, destination + framesUntilWrap * numChannels);
     }
 
-    readFrame_ = (readFrame_ + framesToRead) % capacityFramesLocked();
-    sizeFrames_ -= framesToRead;
+    readPos_.store(currentRead + framesToRead, std::memory_order_release);
     return framesToRead;
 }
 
 std::size_t AudioRingBuffer::availableFrames() const {
-    std::lock_guard lock(mutex_);
-    return sizeFrames_;
+    const std::size_t currentRead = readPos_.load(std::memory_order_relaxed);
+    const std::size_t currentWrite = writePos_.load(std::memory_order_acquire);
+    const std::size_t diff = currentWrite - currentRead;
+    return diff <= capacityFrames_ ? diff : 0;
 }
 
 std::size_t AudioRingBuffer::freeFrames() const {
-    std::lock_guard lock(mutex_);
-    return capacityFramesLocked() - sizeFrames_;
+    if (capacityFrames_ == 0) return 0;
+    const std::size_t currentRead = readPos_.load(std::memory_order_acquire);
+    const std::size_t currentWrite = writePos_.load(std::memory_order_relaxed);
+    const std::size_t diff = currentWrite - currentRead;
+    const std::size_t usedSpace = diff <= capacityFrames_ ? diff : 0;
+    return capacityFrames_ - usedSpace;
 }
 
 int AudioRingBuffer::channels() const {
-    std::lock_guard lock(mutex_);
     return channels_;
 }
 
 void AudioRingBuffer::markEof() {
-    std::lock_guard lock(mutex_);
-    eof_ = true;
+    eof_.store(true, std::memory_order_release);
 }
 
 void AudioRingBuffer::clearEof() {
-    std::lock_guard lock(mutex_);
-    eof_ = false;
+    eof_.store(false, std::memory_order_release);
 }
 
 bool AudioRingBuffer::eof() const {
-    std::lock_guard lock(mutex_);
-    return eof_;
-}
-
-std::size_t AudioRingBuffer::capacityFramesLocked() const {
-    if (channels_ <= 0) {
-        return 0;
-    }
-    return buffer_.size() / static_cast<std::size_t>(channels_);
+    return eof_.load(std::memory_order_acquire);
 }
 
 }  // namespace retrowave

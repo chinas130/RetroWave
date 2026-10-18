@@ -1,53 +1,37 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #pragma once
 
 #include "audio/PlaybackEngine.h"
 #include "core/Settings.h"
 #include "ui/MediaSession.h"
+#include "ui/KeyBinder.h"
+#include "ui/Theme.h"
+#include "ui/LayoutEngine.h"
+#include "ui/views/VisualizerView.h"
+#include "ui/views/LyricsView.h"
 
 #include <chrono>
 #include <csignal>
 #include <limits>
 #include <string>
-#include <vector>
 
 namespace retrowave {
 
-enum class DetailMode {
-    Visualizer,
-    Lyrics
-};
-
 class TerminalUI {
   public:
+    void cycleTheme(int delta);
+    void setTheme(const std::string& name);
+    void setLayoutPreset(const std::string& preset);
+    void cycleLayoutPreset(int delta = 1);
     explicit TerminalUI(PlaybackEngine& engine, const volatile std::sig_atomic_t* shutdownSignal = nullptr);
     ~TerminalUI();
 
     int run();
 
   private:
-    struct Rect {
-        int top = 0;
-        int left = 0;
-        int height = 0;
-        int width = 0;
-    };
-
-    struct Layout {
-        int rows = 0;
-        int cols = 0;
-        Rect header;
-        Rect playlistFrame;
-        Rect playlistContent;
-        Rect albumFrame;
-        Rect cover;
-        Rect meta;
-        Rect time;
-        Rect detailFrame;
-        Rect detailContent;
-    };
-
     void draw(const PlaybackSnapshot& snapshot, std::chrono::steady_clock::time_point now);
-    [[nodiscard]] Layout computeLayout(int rows, int cols) const;
     [[nodiscard]] int computePollTimeout(
         const PlaybackSnapshot& snapshot,
         std::chrono::steady_clock::time_point now) const;
@@ -59,11 +43,6 @@ class TerminalUI {
     void drawCoverPane(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
     void drawMetaPane(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
     void drawTimePane(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
-    void drawVisualizer(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
-    void drawLyrics(int top, int left, int height, int width, const PlaybackSnapshot& snapshot) const;
-    void drawModalOverlay(int rows, int cols, const std::string& title, const std::string& subtitle, const std::string& body) const;
-    void drawLegalScreen(int rows, int cols) const;
-    void drawSettingsOverlay(int rows, int cols) const;
     void handleInput(int key);
     void syncErrorOverlay(const PlaybackSnapshot& snapshot);
     void openWarrantyOverlay();
@@ -82,6 +61,7 @@ class TerminalUI {
     const volatile std::sig_atomic_t* shutdownSignal_ = nullptr;
     SettingsStore settingsStore_;
     AppSettings settings_;
+    ThemeManager themeManager_;
     std::size_t selectedIndex_ = 0;
     bool running_ = true;
     std::string activeError_;
@@ -90,9 +70,10 @@ class TerminalUI {
     std::string modalSubtitle_;
     std::string modalBody_;
     bool settingsOpen_ = false;
-    mutable std::vector<float> visualizerState_;
-    mutable std::size_t visualizerTick_ = 0;
+    int settingsSelectedIndex_ = 0;
+    
     DetailMode detailMode_ = DetailMode::Visualizer;
+    LayoutPreset layoutPreset_ = LayoutPreset::Default;
     Layout layout_;
     bool layoutValid_ = false;
     bool needsFullRedraw_ = true;
@@ -117,7 +98,12 @@ class TerminalUI {
     std::string lastMediaPath_;
     PlaybackState lastMediaState_ = PlaybackState::Idle;
     int lastMediaPositionSecond_ = std::numeric_limits<int>::min();
+    
     MediaSession mediaSession_;
+    KeyBinder keyBinder_;
+
+    VisualizerView visualizerView_;
+    LyricsView lyricsView_;
 };
 
 }  // namespace retrowave

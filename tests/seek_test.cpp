@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "audio/AudioStreamDecoder.h"
 #include "core/Playlist.h"
 #include "audio/PlaybackEngine.h"
@@ -87,7 +90,7 @@ void test_seekSeconds_rewindToStart() {
 
     // Read some frames to advance position
     std::vector<std::int16_t> buffer(4096 * 2, 0);
-    decoder.readFrames(buffer.data(), 2048);
+    (void)decoder.readFrames(buffer.data(), 2048);
     require(!decoder.eof(), "should not be at EOF after partial read");
 
     // Seek back to start
@@ -146,7 +149,6 @@ void test_engine_seek_movesPosition() {
     require(snap.durationSeconds > 0.0, "track should have duration");
 
     // Get baseline position
-    const double initialPos = snap.positionSeconds;
 
     // Seek forward by a significant amount
     const double seekTarget = std::min(snap.durationSeconds * 0.3, std::max(snap.durationSeconds * 0.3, 1.0));

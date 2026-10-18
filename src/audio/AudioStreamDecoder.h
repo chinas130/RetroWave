@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #pragma once
 
 #include "audio/ExternalProcess.h"
@@ -9,6 +12,7 @@
 #include <vector>
 
 extern "C" {
+#include <libavutil/channel_layout.h>
 struct AVCodecContext;
 struct AVFormatContext;
 struct AVFrame;
@@ -65,6 +69,11 @@ class AudioStreamDecoder {
     bool isConverted_ = false;
     std::vector<std::int16_t> pendingSamples_;
     std::size_t pendingOffset_ = 0;
+
+    int currentSampleRate_ = 0;
+    int currentSampleFormat_ = -1;
+    int currentChannels_ = 0;
+    AVChannelLayout currentLayout_{};
 };
 
 }  // namespace retrowave

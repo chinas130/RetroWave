@@ -70,6 +70,10 @@ When making changes, optimize for:
 ## Coding Guidelines
 
 - Use C++20.
+- Compile with strict warnings (`-Wall -Wextra -Wpedantic`) and resolve all of them.
+- Follow interface decomposition principles: use a component-based approach for the UI, ensuring panel isolation and avoiding a bloated `TerminalUI`.
+- Maintain a lock-free audio stream to prevent audio dropouts.
+- Handle errors gracefully without causing `ncurses` to crash or leave the terminal in a broken state.
 - Keep files focused and avoid over-abstracting small flows.
 - Prefer straightforward code over framework-like architecture.
 - Preserve the current naming style and formatting in nearby files.
@@ -98,15 +102,16 @@ If a change risks higher memory or CPU usage, call that out explicitly in the pu
 
 ## Testing
 
-There is no full automated test suite yet.
+All new features and architectural changes should be accompanied by unit tests in the `tests/` directory.
 
 At minimum, validate:
 
 1. the project builds cleanly
-2. the player launches
-3. playlist navigation still works
-4. playback still starts
-5. lyrics mode still behaves correctly when `.lrc` is present and absent
+2. unit tests pass by running `ctest` in the `build/` directory
+3. the player launches
+4. playlist navigation still works
+5. playback still starts
+6. lyrics mode still behaves correctly when `.lrc` is present and absent
 
 Suggested commands:
 

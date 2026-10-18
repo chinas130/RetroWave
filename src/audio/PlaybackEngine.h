@@ -1,11 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #pragma once
 
 #include "audio/AudioDecoder.h"
 #include "audio/AudioRingBuffer.h"
 #include "audio/MetadataCache.h"
 #include "audio/WaveformCache.h"
-#include "core/PlaybackMode.h"
 #include "core/Playlist.h"
+#include "core/TrackQueue.h"
 
 #include <array>
 #include <atomic>
@@ -74,6 +77,7 @@ class PlaybackEngine {
     void togglePause();
     void next();
     void previous();
+    void stop();
     bool seek(double seconds);
     void adjustVolume(float delta);
     void setVolume(float value);
@@ -91,14 +95,6 @@ class PlaybackEngine {
     [[nodiscard]] PlaybackState state() const noexcept;
     void setState(PlaybackState state) noexcept;
     [[nodiscard]] bool playbackBlocked() const noexcept;
-    [[nodiscard]] std::optional<std::size_t> computeNextIndex(std::size_t currentIndex);
-    [[nodiscard]] std::size_t computePreviousIndex(std::size_t currentIndex);
-    void clearShuffleHistory();
-    void trimShuffleHistory();
-    void syncShufflePosition(std::size_t index);
-    void rebuildShuffleOrder(std::size_t anchorIndex);
-    [[nodiscard]] std::size_t findShufflePosition(std::size_t index) const;
-    [[nodiscard]] std::size_t startNewShufflePass(std::size_t avoidIndex);
     void loaderLoop();
     [[nodiscard]] bool loadStillCurrent(std::uint64_t generation) const noexcept;
     void loadIndex(std::size_t index, std::uint64_t generation);
@@ -138,26 +134,22 @@ class PlaybackEngine {
     std::atomic<bool> stopDecoder_{false};
     std::atomic<bool> decoderThreadActive_{false};
     std::atomic<bool> stopLoader_{false};
+    std::atomic<bool> hasTrack_{false};
     std::atomic<PlaybackState> state_{PlaybackState::Idle};
     std::atomic<bool> currentRemote_{false};
     std::atomic<bool> currentLive_{false};
     std::atomic<bool> pendingAdvance_{false};
     std::atomic<bool> trackEnded_{false};
+    std::atomic<double> requestedSeekSeconds_{-1.0};
     std::atomic<float> volume_{0.85F};
     std::atomic<float> level_{0.0F};
-    std::atomic<RepeatMode> repeatMode_{RepeatMode::Off};
-    std::atomic<ShuffleMode> shuffleMode_{ShuffleMode::Off};
 
-    mutable std::mutex shuffleMutex_;
-    std::vector<std::size_t> shuffleOrder_;
-    std::size_t shufflePosition_ = 0;
-    std::vector<std::size_t> playbackHistory_;
-    static constexpr std::size_t kMaxPlaybackHistory = 256;
+    TrackQueue queue_;
 
     std::filesystem::path samplingPath_;
-    std::array<float, kWaveformBinCount> samplingBins_{};
-    std::size_t samplingTotalFrames_ = 0;
-    bool samplingActive_ = false;
+    std::array<std::atomic<float>, kWaveformBinCount> samplingBins_{};
+    std::atomic<std::size_t> samplingTotalFrames_{0};
+    std::atomic<bool> samplingActive_{false};
 };
 
 }  // namespace retrowave

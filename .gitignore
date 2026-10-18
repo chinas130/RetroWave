@@ -1,6 +1,9 @@
 build/
+scratch_*
+*.diff
+*.patch
 .DS_Store
-scratch_event.mm
-scratch_main.mm
-scratch_test.mm
-scratch_test
+a.out
+*.out
+internal/
+Spotlight*

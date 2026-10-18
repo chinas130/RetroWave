@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "audio/PlaybackEngine.h"
 
 #include "audio/AudioOutput.h"
 #include "audio/AudioStreamDecoder.h"
+#include "core/EventHooks.h"
+
 
 #include <algorithm>
 #include <array>
@@ -16,7 +21,7 @@ namespace retrowave {
 namespace {
 
 constexpr float kInt16Scale = 32767.0F;
-constexpr std::size_t kStreamBufferFrames = static_cast<std::size_t>(AudioOutput::sampleRate()) / 2;
+constexpr std::size_t kStreamBufferFrames = 32768;
 constexpr std::size_t kDecoderChunkFrames = 2048;
 constexpr auto kDecoderSleep = std::chrono::milliseconds(12);
 
@@ -120,7 +125,7 @@ void PlaybackEngine::update() {
 
     if (pendingAdvance_.exchange(false)) {
         const auto currentIndex = currentIndex_.load();
-        if (const auto nextIndex = computeNextIndex(currentIndex)) {
+        if (const auto nextIndex = queue_.getNext(currentIndex, playlist_.size())) {
             playIndexInternal(*nextIndex);
         } else {
             setState(PlaybackState::Ended);
@@ -143,10 +148,13 @@ void PlaybackEngine::update() {
         return;
     }
 
-    if (samplingActive_) {
+    if (samplingActive_.load(std::memory_order_relaxed)) {
         std::lock_guard lock(mutex_);
         if (currentTrack_ && currentTrack_->metadata.path == samplingPath_) {
-            currentTrack_->metadata.waveform.assign(samplingBins_.begin(), samplingBins_.end());
+            currentTrack_->metadata.waveform.resize(samplingBins_.size());
+            for (std::size_t i = 0; i < samplingBins_.size(); ++i) {
+                currentTrack_->metadata.waveform[i] = samplingBins_[i].load(std::memory_order_relaxed);
+            }
         }
     }
 
@@ -162,7 +170,7 @@ void PlaybackEngine::update() {
 }
 
 bool PlaybackEngine::playIndex(std::size_t index) {
-    clearShuffleHistory();
+    queue_.clearHistory();
     return playIndexInternal(index);
 }
 
@@ -171,9 +179,7 @@ bool PlaybackEngine::playIndexInternal(std::size_t index) {
         return false;
     }
 
-    if (shuffleMode() == ShuffleMode::On) {
-        syncShufflePosition(index);
-    }
+    queue_.onTrackSelected(index, playlist_.size());
 
     const auto generation = loadGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
     loadingIndex_.store(index);
@@ -214,19 +220,24 @@ void PlaybackEngine::loaderLoop() {
 }
 
 void PlaybackEngine::finalizeWaveformSampling() {
-    if (!samplingActive_) {
+    if (!samplingActive_.load(std::memory_order_relaxed)) {
         return;
     }
 
-    std::vector<float> waveform(samplingBins_.begin(), samplingBins_.end());
+    std::vector<float> waveform(samplingBins_.size());
+    for (std::size_t i = 0; i < samplingBins_.size(); ++i) {
+        waveform[i] = samplingBins_[i].load(std::memory_order_relaxed);
+    }
     const auto path = samplingPath_;
     const bool sparse =
         std::count_if(waveform.begin(), waveform.end(), [](float value) { return value > 0.001F; }) < 8;
 
-    samplingActive_ = false;
+    samplingActive_.store(false, std::memory_order_release);
     samplingPath_.clear();
-    samplingTotalFrames_ = 0;
-    samplingBins_.fill(0.0F);
+    samplingTotalFrames_.store(0, std::memory_order_relaxed);
+    for (auto& bin : samplingBins_) {
+        bin.store(0.0F, std::memory_order_relaxed);
+    }
 
     if (path.empty()) {
         return;
@@ -251,14 +262,21 @@ void PlaybackEngine::ensureLyrics() {
 }
 
 void PlaybackEngine::sampleWaveformFrame(std::size_t absoluteFrame, float peak) noexcept {
-    if (!samplingActive_ || samplingTotalFrames_ == 0 || peak <= 0.0F) {
+    const auto totalFrames = samplingTotalFrames_.load(std::memory_order_relaxed);
+    if (!samplingActive_.load(std::memory_order_relaxed) || totalFrames == 0 || peak <= 0.0F) {
         return;
     }
 
     const std::size_t bin = std::min(
         kWaveformBinCount - 1,
-        (absoluteFrame * kWaveformBinCount) / samplingTotalFrames_);
-    samplingBins_[bin] = std::max(samplingBins_[bin], peak);
+        (absoluteFrame * kWaveformBinCount) / totalFrames);
+    
+    float current = samplingBins_[bin].load(std::memory_order_relaxed);
+    while (peak > current) {
+        if (samplingBins_[bin].compare_exchange_weak(current, peak, std::memory_order_relaxed)) {
+            break;
+        }
+    }
 }
 
 bool PlaybackEngine::loadStillCurrent(std::uint64_t generation) const noexcept {
@@ -316,14 +334,17 @@ void PlaybackEngine::loadIndex(std::size_t index, std::uint64_t generation) {
                 decoded.metadata.waveform = *cachedWaveform;
             } else {
                 samplingPath_ = trackPath;
-                samplingBins_.fill(0.0F);
-                samplingTotalFrames_ = decoded.metadata.durationSeconds > 0.0
+                for (auto& bin : samplingBins_) {
+                    bin.store(0.0F, std::memory_order_relaxed);
+                }
+                const auto totalFrames = decoded.metadata.durationSeconds > 0.0
                     ? std::max<std::size_t>(
                           1,
                           static_cast<std::size_t>(
                               decoded.metadata.durationSeconds * static_cast<double>(AudioOutput::sampleRate())))
                     : 0;
-                samplingActive_ = samplingTotalFrames_ > 0;
+                samplingTotalFrames_.store(totalFrames, std::memory_order_relaxed);
+                samplingActive_.store(totalFrames > 0, std::memory_order_release);
             }
         }
 
@@ -363,40 +384,47 @@ void PlaybackEngine::loadIndex(std::size_t index, std::uint64_t generation) {
         }
 
         if (!loadStillCurrent(generation)) {
-            ringBuffer_.clear();
-            ringBuffer_.clearEof();
+            ringBuffer_.flush();
+            
             return;
         }
 
+        std::string titleStr, artistStr, albumStr, pathStr;
+        int durationSec = 0;
         {
             std::lock_guard lock(mutex_);
             currentTrack_ = std::move(decoded);
             currentTrack_->metadata.lyricsResolved = false;
+            
+            titleStr = currentTrack_->metadata.title;
+            artistStr = currentTrack_->metadata.artist;
+            albumStr = currentTrack_->metadata.album;
+            durationSec = static_cast<int>(currentTrack_->metadata.durationSeconds);
+            pathStr = currentTrack_->metadata.path;
+
             currentIndex_.store(index);
             playbackFrame_.store(0);
             trackEnded_.store(false);
             level_.store(0.0F);
             currentRemote_.store(remote);
-            currentLive_.store(decoded.metadata.live);
+            currentLive_.store(currentTrack_->metadata.live);
             streamDecoder_ = std::move(streamDecoder);
-        }
 
-        // Wait for any previous decoder thread to fully exit before starting a new one
-        while (decoderThreadActive_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+            stopDecoder_.store(false, std::memory_order_release);
+            hasTrack_.store(true, std::memory_order_release);
+            decoderThread_ = std::thread([this]() { decoderLoop(); });
+            setState(PlaybackState::Playing);
         }
-        stopDecoder_.store(false);
-        decoderThread_ = std::thread([this]() { decoderLoop(); });
-        setState(PlaybackState::Playing);
+        EventHooks::onTrackChange(titleStr, artistStr, albumStr, durationSec, pathStr);
     } catch (const std::exception& error) {
-        samplingActive_ = false;
+        samplingActive_.store(false, std::memory_order_release);
         if (!loadStillCurrent(generation)) {
             return;
         }
         std::lock_guard lock(mutex_);
         lastError_ = error.what();
         setState(PlaybackState::Failed);
-        ringBuffer_.clear();
+        ringBuffer_.flush();
     }
 }
 
@@ -415,7 +443,7 @@ void PlaybackEngine::next() {
     }
 
     const auto currentIndex = navigationBaseIndex();
-    if (const auto nextIndex = computeNextIndex(currentIndex)) {
+    if (const auto nextIndex = queue_.getNext(currentIndex, playlist_.size())) {
         playIndexInternal(*nextIndex);
     }
 }
@@ -426,7 +454,7 @@ void PlaybackEngine::previous() {
     }
 
     const auto currentIndex = navigationBaseIndex();
-    playIndexInternal(computePreviousIndex(currentIndex));
+    playIndexInternal(queue_.getPrevious(currentIndex, playlist_.size()));
 }
 
 void PlaybackEngine::adjustVolume(float delta) {
@@ -434,66 +462,15 @@ void PlaybackEngine::adjustVolume(float delta) {
 }
 
 bool PlaybackEngine::seek(double seconds) {
-    // Stop the decoder thread to prevent concurrent access to streamDecoder_
-    stopDecoder_.store(true);
-    {
-        std::lock_guard lock(mutex_);
-        if (streamDecoder_) {
-            streamDecoder_->requestStop();
-        }
-    }
-
-    if (decoderThread_.joinable()) {
-        decoderThread_.join();
-    }
-
-    // Wait for decoderLoop to fully exit and mark itself inactive
-    while (decoderThreadActive_.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-
     std::lock_guard lock(mutex_);
-    if (!currentTrack_ || currentTrack_->metadata.remote || currentTrack_->metadata.live) {
-        while (decoderThreadActive_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
-        stopDecoder_.store(false);
-        decoderThread_ = std::thread([this]() { decoderLoop(); });
-        return false;
-    }
-    if (streamDecoder_ == nullptr) {
-        while (decoderThreadActive_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
-        stopDecoder_.store(false);
-        decoderThread_ = std::thread([this]() { decoderLoop(); });
+    if (state() == PlaybackState::Loading || !currentTrack_ || currentTrack_->metadata.remote || currentTrack_->metadata.live || !streamDecoder_) {
         return false;
     }
 
     const double clamped = std::clamp(seconds, 0.0, currentTrack_->metadata.durationSeconds);
-    if (!streamDecoder_->seekSeconds(clamped)) {
-        while (decoderThreadActive_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
-        stopDecoder_.store(false);
-        decoderThread_ = std::thread([this]() { decoderLoop(); });
-        return false;
-    }
-
-    ringBuffer_.clear();
-    ringBuffer_.clearEof();
-    playbackFrame_.store(static_cast<std::size_t>(clamped * AudioOutput::sampleRate()));
-    trackEnded_.store(false);
-    pendingAdvance_.store(false);
-    level_.store(0.0F);
+    requestedSeekSeconds_.store(clamped, std::memory_order_release);
     setState(PlaybackState::Playing);
-
-    // Wait for decoderLoop to fully exit before restarting
-    while (decoderThreadActive_.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-    stopDecoder_.store(false);
-    decoderThread_ = std::thread([this]() { decoderLoop(); });
+    
     return true;
 }
 
@@ -502,27 +479,19 @@ void PlaybackEngine::setVolume(float value) {
 }
 
 void PlaybackEngine::setRepeatMode(RepeatMode mode) {
-    repeatMode_.store(mode);
+    queue_.setRepeatMode(mode);
 }
 
 RepeatMode PlaybackEngine::repeatMode() const noexcept {
-    return repeatMode_.load();
+    return queue_.repeatMode();
 }
 
 void PlaybackEngine::setShuffleMode(ShuffleMode mode) {
-    shuffleMode_.store(mode);
-    if (mode == ShuffleMode::On) {
-        syncShufflePosition(navigationBaseIndex());
-        clearShuffleHistory();
-    } else {
-        std::lock_guard lock(shuffleMutex_);
-        shuffleOrder_.clear();
-        playbackHistory_.clear();
-    }
+    queue_.setShuffleMode(mode, navigationBaseIndex(), playlist_.size());
 }
 
 ShuffleMode PlaybackEngine::shuffleMode() const noexcept {
-    return shuffleMode_.load();
+    return queue_.shuffleMode();
 }
 
 PlaybackSnapshot PlaybackEngine::snapshot() const {
@@ -584,29 +553,30 @@ void PlaybackEngine::publishVisualizer(const std::array<float, kPlaybackVisualiz
 }
 
 void PlaybackEngine::stopDecoderThread() {
-    stopDecoder_.store(true);
+    std::thread threadToJoin;
+    std::unique_ptr<AudioStreamDecoder> decoderToClose;
+
+    hasTrack_.store(false, std::memory_order_release);
+    stopDecoder_.store(true, std::memory_order_release);
 
     {
         std::lock_guard lock(mutex_);
         if (streamDecoder_) {
             streamDecoder_->requestStop();
         }
-    }
-
-    if (decoderThread_.joinable()) {
-        decoderThread_.join();
-    }
-
-    std::unique_ptr<AudioStreamDecoder> decoderToClose;
-    {
-        std::lock_guard lock(mutex_);
+        threadToJoin = std::move(decoderThread_);
         decoderToClose = std::move(streamDecoder_);
     }
+
+    if (threadToJoin.joinable()) {
+        threadToJoin.join();
+    }
+
     if (decoderToClose) {
         decoderToClose->close();
     }
-    ringBuffer_.clear();
-    ringBuffer_.clearEof();
+    ringBuffer_.flush();
+    
     currentRemote_.store(false);
     currentLive_.store(false);
 }
@@ -620,7 +590,26 @@ PlaybackState PlaybackEngine::state() const noexcept {
 }
 
 void PlaybackEngine::setState(PlaybackState state) noexcept {
-    state_.store(state);
+    PlaybackState oldState = state_.exchange(state);
+    if (oldState != state) {
+        std::string stateStr;
+        switch (state) {
+            case PlaybackState::Playing: stateStr = "playing"; break;
+            case PlaybackState::Paused: stateStr = "paused"; break;
+            case PlaybackState::Idle:
+            case PlaybackState::Ended:
+            case PlaybackState::Failed: stateStr = "stopped"; break;
+            default: break;
+        }
+        if (!stateStr.empty()) {
+            EventHooks::onStateChange(stateStr);
+        }
+    }
+}
+
+void PlaybackEngine::stop() {
+    stopDecoderThread();
+    setState(PlaybackState::Idle);
 }
 
 bool PlaybackEngine::playbackBlocked() const noexcept {
@@ -632,165 +621,7 @@ bool PlaybackEngine::playbackBlocked() const noexcept {
         currentState == PlaybackState::Failed;
 }
 
-void PlaybackEngine::clearShuffleHistory() {
-    std::lock_guard lock(shuffleMutex_);
-    playbackHistory_.clear();
-    playbackHistory_.shrink_to_fit();
-}
 
-void PlaybackEngine::trimShuffleHistory() {
-    if (playbackHistory_.size() <= kMaxPlaybackHistory) {
-        return;
-    }
-
-    const auto eraseCount = playbackHistory_.size() - kMaxPlaybackHistory;
-    playbackHistory_.erase(playbackHistory_.begin(), playbackHistory_.begin() + static_cast<std::ptrdiff_t>(eraseCount));
-}
-
-void PlaybackEngine::rebuildShuffleOrder(std::size_t anchorIndex) {
-    const auto count = playlist_.size();
-    shuffleOrder_.resize(count);
-    if (count == 0) {
-        shufflePosition_ = 0;
-        return;
-    }
-
-    std::iota(shuffleOrder_.begin(), shuffleOrder_.end(), std::size_t{0});
-    if (count > 1) {
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        for (std::size_t i = count - 1; i > 0; --i) {
-            std::uniform_int_distribution<std::size_t> dis(0, i);
-            std::swap(shuffleOrder_[i], shuffleOrder_[dis(gen)]);
-        }
-    }
-
-    shufflePosition_ = findShufflePosition(anchorIndex);
-}
-
-std::size_t PlaybackEngine::findShufflePosition(std::size_t index) const {
-    for (std::size_t position = 0; position < shuffleOrder_.size(); ++position) {
-        if (shuffleOrder_[position] == index) {
-            return position;
-        }
-    }
-    return 0;
-}
-
-void PlaybackEngine::syncShufflePosition(std::size_t index) {
-    std::lock_guard lock(shuffleMutex_);
-    if (shuffleOrder_.size() != playlist_.size()) {
-        rebuildShuffleOrder(index);
-        return;
-    }
-    shufflePosition_ = findShufflePosition(index);
-}
-
-std::size_t PlaybackEngine::startNewShufflePass(std::size_t avoidIndex) {
-    rebuildShuffleOrder(avoidIndex);
-    if (shuffleOrder_.size() <= 1) {
-        shufflePosition_ = 0;
-        return shuffleOrder_.empty() ? 0 : shuffleOrder_.front();
-    }
-
-    shufflePosition_ = 0;
-    if (shuffleOrder_[0] != avoidIndex) {
-        return shuffleOrder_[0];
-    }
-
-    shufflePosition_ = 1;
-    return shuffleOrder_[1];
-}
-
-std::optional<std::size_t> PlaybackEngine::computeNextIndex(std::size_t currentIndex) {
-    const auto count = playlist_.size();
-    if (count == 0) {
-        return std::nullopt;
-    }
-
-    if (shuffleMode() == ShuffleMode::Off) {
-        if (currentIndex + 1 < count) {
-            return currentIndex + 1;
-        }
-
-        switch (repeatMode()) {
-            case RepeatMode::One:
-                return currentIndex;
-            case RepeatMode::All:
-                return 0;
-            case RepeatMode::Off:
-                return std::nullopt;
-        }
-    }
-
-    std::lock_guard lock(shuffleMutex_);
-    if (shuffleOrder_.size() != count) {
-        rebuildShuffleOrder(currentIndex);
-    }
-
-    auto recordHistory = [this, currentIndex]() {
-        if (playbackHistory_.empty() || playbackHistory_.back() != currentIndex) {
-            playbackHistory_.push_back(currentIndex);
-            trimShuffleHistory();
-        }
-    };
-
-    if (shufflePosition_ + 1 < shuffleOrder_.size()) {
-        recordHistory();
-        shufflePosition_++;
-        return shuffleOrder_[shufflePosition_];
-    }
-
-    switch (repeatMode()) {
-        case RepeatMode::One:
-            return currentIndex;
-        case RepeatMode::All:
-            recordHistory();
-            return startNewShufflePass(currentIndex);
-        case RepeatMode::Off:
-            return std::nullopt;
-    }
-
-    return std::nullopt;
-}
-
-std::size_t PlaybackEngine::computePreviousIndex(std::size_t currentIndex) {
-    const auto count = playlist_.size();
-    if (count == 0) {
-        return 0;
-    }
-
-    if (shuffleMode() == ShuffleMode::Off) {
-        if (currentIndex > 0) {
-            return currentIndex - 1;
-        }
-        return repeatMode() == RepeatMode::All ? count - 1 : 0;
-    }
-
-    std::lock_guard lock(shuffleMutex_);
-    if (shuffleOrder_.size() != count) {
-        rebuildShuffleOrder(currentIndex);
-    }
-
-    if (!playbackHistory_.empty()) {
-        const auto previousIndex = playbackHistory_.back();
-        playbackHistory_.pop_back();
-        shufflePosition_ = findShufflePosition(previousIndex);
-        return previousIndex;
-    }
-
-    if (shufflePosition_ > 0) {
-        shufflePosition_--;
-        return shuffleOrder_[shufflePosition_];
-    }
-
-    if (repeatMode() == RepeatMode::All && count > 1) {
-        shufflePosition_ = count - 1;
-        return shuffleOrder_[shufflePosition_];
-    }
-
-    return currentIndex;
-}
 
 void PlaybackEngine::decoderLoop() {
     decoderThreadActive_.store(true, std::memory_order_release);
@@ -806,6 +637,16 @@ void PlaybackEngine::decoderLoop() {
         if (streamDecoder == nullptr) {
             decoderThreadActive_.store(false, std::memory_order_release);
             return;
+        }
+
+        const double seekTarget = requestedSeekSeconds_.exchange(-1.0, std::memory_order_acquire);
+        if (seekTarget >= 0.0) {
+            if (streamDecoder->seekSeconds(seekTarget)) {
+                ringBuffer_.flush();
+                playbackFrame_.store(static_cast<std::size_t>(seekTarget * static_cast<double>(AudioOutput::sampleRate())), std::memory_order_relaxed);
+                trackEnded_.store(false, std::memory_order_relaxed);
+                pendingAdvance_.store(false, std::memory_order_relaxed);
+            }
         }
 
         if (ringBuffer_.freeFrames() < kDecoderChunkFrames / 2) {
@@ -854,35 +695,23 @@ std::size_t PlaybackEngine::renderFrames(std::int16_t* destination, std::size_t 
         return 0;
     }
 
-    if (playbackBlocked()) {
-        std::fill(destination, destination + frames * 2, 0);
-        level_.store(0.0F);
+    if (playbackBlocked() || !hasTrack_.load(std::memory_order_acquire)) {
+        std::fill_n(destination, frames * 2, 0);
+        level_.store(0.0F, std::memory_order_relaxed);
         publishVisualizer({});
         return frames;
     }
 
-    {
-        std::lock_guard lock(mutex_);
-        if (!currentTrack_) {
-            std::fill(destination, destination + frames * 2, 0);
-            level_.store(0.0F);
-            publishVisualizer({});
-            return frames;
-        }
-    }
-
     const auto framesRead = ringBuffer_.pop(destination, frames);
     const int channels = std::max(1, ringBuffer_.channels());
-    const float gain = volume_.load();
+    const float gain = volume_.load(std::memory_order_relaxed);
 
     if (framesRead < frames) {
-        std::fill(
-            destination + framesRead * static_cast<std::size_t>(channels),
-            destination + frames * static_cast<std::size_t>(channels),
-            0);
+        std::fill_n(destination + framesRead * static_cast<std::size_t>(channels),
+                    (frames - framesRead) * static_cast<std::size_t>(channels), 0);
     }
 
-    const std::size_t frameBase = playbackFrame_.load();
+    const std::size_t frameBase = playbackFrame_.load(std::memory_order_relaxed);
     float peak = 0.0F;
     for (std::size_t frame = 0; frame < framesRead; ++frame) {
         float framePeak = 0.0F;
@@ -896,13 +725,13 @@ std::size_t PlaybackEngine::renderFrames(std::int16_t* destination, std::size_t 
         sampleWaveformFrame(frameBase + frame, framePeak);
     }
 
-    playbackFrame_.store(frameBase + framesRead);
-    level_.store(peak);
+    playbackFrame_.store(frameBase + framesRead, std::memory_order_relaxed);
+    level_.store(peak, std::memory_order_relaxed);
     publishVisualizer(buildVisualizerWindow(destination, framesRead, channels));
 
     if (framesRead < frames && ringBuffer_.eof()) {
-        if (!trackEnded_.exchange(true)) {
-            pendingAdvance_.store(true);
+        if (!trackEnded_.exchange(true, std::memory_order_acq_rel)) {
+            pendingAdvance_.store(true, std::memory_order_release);
         }
     }
 
