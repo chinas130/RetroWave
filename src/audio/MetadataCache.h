@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #pragma once
 
 #include "audio/AudioDecoder.h"
@@ -34,7 +37,7 @@ class MetadataCache {
     void touchReadyKey(const CacheKey& key);
     void evictIfNeeded();
 
-    static constexpr std::size_t maxReadyEntries_ = 6;
+    static constexpr std::size_t maxReadyEntries_ = 128;
     mutable std::mutex mutex_;
     std::unordered_map<CacheKey, TrackMetadata, CacheKeyHash> ready_;
     std::deque<CacheKey> readyOrder_;

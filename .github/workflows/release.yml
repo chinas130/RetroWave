@@ -81,7 +81,7 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: Install to package root
-        run: cmake --install build --prefix "${RUNNER_TEMP}/retrowave-install"
+        run: cmake --install build --strip --prefix "${RUNNER_TEMP}/retrowave-install"
 
       - name: Package binary archive
         id: package

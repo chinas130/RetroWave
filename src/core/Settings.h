@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #pragma once
 
 #include "core/PlaybackMode.h"
-
+#include <toml++/toml.h>
 #include <filesystem>
+#include <string>
 
 namespace retrowave {
 
@@ -17,6 +21,9 @@ struct AppSettings {
     CoverArtMode coverArtMode = CoverArtMode::Ascii;
     RepeatMode repeatMode = RepeatMode::Off;
     ShuffleMode shuffleMode = ShuffleMode::Off;
+    std::string theme = "retrowave";
+    std::string layoutPreset = "default";
+    toml::table keysTable;
 };
 
 class SettingsStore {

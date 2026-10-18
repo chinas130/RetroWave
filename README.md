@@ -29,8 +29,6 @@ Current scope:
 Current limitations:
 
 - no official Homebrew bottle or tap publication yet
-- no seek support yet
-- no shuffle mode yet
 
 ## Features
 
@@ -39,9 +37,13 @@ Current limitations:
 - Load simple local or remote `.m3u`, `.m3u8`, and `.pls` playlists
 - Support for common formats via FFmpeg: `mp3`, `flac`, `wav`, `m4a`, `ogg`, `opus`, `aac`, `aiff`, `alac`, `wma`
 - Album card with metadata and multiple text-mode cover renderers: `ASCII`, `Block Shading`, `Half-Block`
+- **ThemeManager**: Built-in color themes (Catppuccin Mocha, Gruvbox Dark, Nord, Monochrome) and support for custom TOML themes
+- **LayoutPresets**: Modular layout modes (`Default`, `VisualizerFocus`, `LyricsFocus`, `Compact`) toggled via `Tab`
+- **IPC & CLI Control**: Remote control via UNIX Domain Sockets (`/tmp/retrowave-$UID.sock`) using CLI commands (`retrowave next`, `retrowave status`, `retrowave volume +10`)
+- **EventHooks**: Asynchronous script hooks in `~/.config/retrowave/hooks/` (e.g., `on-track-change.sh`, `on-state-change.sh`)
 - Toggle between `Visualizer` and `Lyrics` panels with `t`
 - Timed lyric highlighting and auto-centering for `.lrc` files
-- Settings modal with persisted volume and cover-art mode
+- Settings modal with persisted volume, theme, layout, and cover-art mode
 - Animated visualizer
 - In-app modal error overlay instead of terminal log spam
 - Project manual available through `man`
@@ -154,7 +156,8 @@ MANPATH="$PWD/man" man retrowave
 - `+` / `-`: adjust volume
 - `r`: cycle repeat mode: off, one, all
 - `t`: toggle visualizer and lyrics panel
-- `s`: open settings modal
+- `Tab`: cycle layout presets (`Default`, `VisualizerFocus`, `LyricsFocus`, `Compact`)
+- `s`: open settings modal (use `Up`/`Down` to select Renderer, Theme, Layout; `Left`/`Right` to change values)
 - `w`: show warranty notice
 - `c`: show redistribution notice
 - `q`: quit
@@ -230,8 +233,6 @@ Recent optimization work includes:
 
 ## Roadmap
 
-- seeking
-- shuffle
 - better album-art downsampling for tiny embedded covers
 - richer metadata display
 - disk-backed waveform cache

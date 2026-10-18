@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #include "audio/AudioStreamDecoder.h"
 
 #include "audio/YtDlpResolver.h"
@@ -10,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -18,6 +22,7 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
+#include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 }
 
@@ -168,36 +173,6 @@ void AudioStreamDecoder::openInput(const std::string& input, const std::string& 
     const int codecOpenResult = avcodec_open2(codecContext_, codec, nullptr);
     if (codecOpenResult < 0) {
         throw std::runtime_error("Cannot open streaming decoder: " + ffmpegError(codecOpenResult));
-    }
-
-    AVChannelLayout outLayout;
-    av_channel_layout_default(&outLayout, kOutputChannels);
-
-    AVChannelLayout inLayout = codecContext_->ch_layout;
-    if (inLayout.nb_channels == 0) {
-        av_channel_layout_default(&inLayout, 2);
-    }
-
-    const int swrSetupResult = swr_alloc_set_opts2(
-        &resampler_,
-        &outLayout,
-        AV_SAMPLE_FMT_S16,
-        kOutputSampleRate,
-        &inLayout,
-        codecContext_->sample_fmt,
-        codecContext_->sample_rate,
-        0,
-        nullptr);
-
-    if (swrSetupResult < 0 || resampler_ == nullptr) {
-        av_channel_layout_uninit(&outLayout);
-        throw std::runtime_error("Cannot configure streaming resampler: " + ffmpegError(swrSetupResult));
-    }
-
-    const int swrInitResult = swr_init(resampler_);
-    av_channel_layout_uninit(&outLayout);
-    if (swrInitResult < 0) {
-        throw std::runtime_error("Cannot initialize streaming resampler: " + ffmpegError(swrInitResult));
     }
 
     originalInput_ = input;
@@ -384,6 +359,7 @@ void AudioStreamDecoder::close() {
     readEof_ = false;
     flushSent_ = false;
     durationSeconds_ = 0.0;
+    av_channel_layout_uninit(&currentLayout_);
 }
 
 std::size_t AudioStreamDecoder::readFrames(std::int16_t* destination, std::size_t maxFrames) {
@@ -424,18 +400,33 @@ std::size_t AudioStreamDecoder::readFrames(std::int16_t* destination, std::size_
 }
 
 std::size_t AudioStreamDecoder::readConvertedFrames(std::int16_t* destination, std::size_t maxFrames) {
-    FILE* stream = converterProcess_.stdoutStream();
-    if (stream == nullptr) {
+    const int fd = converterProcess_.stdoutFd();
+    if (fd < 0) {
         eof_ = true;
         return 0;
     }
 
-    const std::size_t samplesRequested = maxFrames * static_cast<std::size_t>(kOutputChannels);
-    const std::size_t samplesRead = std::fread(destination, sizeof(std::int16_t), samplesRequested, stream);
-    if (samplesRead < samplesRequested) {
-        eof_ = true;
+    const std::size_t bytesRequested = maxFrames * static_cast<std::size_t>(kOutputChannels) * sizeof(std::int16_t);
+    std::size_t totalBytesRead = 0;
+    auto* destBytes = reinterpret_cast<char*>(destination);
+
+    while (totalBytesRead < bytesRequested) {
+        const ssize_t bytesRead = ::read(fd, destBytes + totalBytesRead, bytesRequested - totalBytesRead);
+        if (bytesRead > 0) {
+            totalBytesRead += bytesRead;
+        } else if (bytesRead == 0) {
+            eof_ = true;
+            break;
+        } else {
+            if (errno == EINTR) {
+                continue;
+            }
+            eof_ = true;
+            break;
+        }
     }
-    return samplesRead / static_cast<std::size_t>(kOutputChannels);
+
+    return totalBytesRead / (static_cast<std::size_t>(kOutputChannels) * sizeof(std::int16_t));
 }
 
 bool AudioStreamDecoder::eof() const noexcept {
@@ -464,10 +455,62 @@ bool AudioStreamDecoder::decodeNextChunk() {
     while (true) {
         const int receiveResult = avcodec_receive_frame(codecContext_, frame_);
         if (receiveResult == 0) {
+            if (resampler_ == nullptr ||
+                frame_->sample_rate != currentSampleRate_ ||
+                frame_->format != currentSampleFormat_ ||
+                frame_->ch_layout.nb_channels != currentChannels_ ||
+                av_channel_layout_compare(&frame_->ch_layout, &currentLayout_) != 0) {
+
+                currentSampleRate_ = frame_->sample_rate;
+                currentSampleFormat_ = frame_->format;
+                currentChannels_ = frame_->ch_layout.nb_channels;
+
+                AVChannelLayout outLayout;
+                av_channel_layout_default(&outLayout, kOutputChannels);
+
+                AVChannelLayout inLayout;
+                av_channel_layout_copy(&inLayout, &frame_->ch_layout);
+                if (inLayout.order == AV_CHANNEL_ORDER_UNSPEC || inLayout.nb_channels == 0) {
+                    av_channel_layout_uninit(&inLayout);
+                    av_channel_layout_default(&inLayout, frame_->ch_layout.nb_channels > 0 ? frame_->ch_layout.nb_channels : 2);
+                }
+
+                int swrSetupResult = swr_alloc_set_opts2(
+                    &resampler_,
+                    &outLayout,
+                    AV_SAMPLE_FMT_S16,
+                    kOutputSampleRate,
+                    &inLayout,
+                    static_cast<AVSampleFormat>(frame_->format),
+                    frame_->sample_rate,
+                    0,
+                    nullptr);
+
+                av_channel_layout_uninit(&inLayout);
+                av_channel_layout_uninit(&outLayout);
+
+                if (swrSetupResult < 0 || resampler_ == nullptr) {
+                    av_frame_unref(frame_);
+                    throw std::runtime_error("Cannot configure streaming resampler: " + ffmpegError(swrSetupResult));
+                }
+
+                // Apply matrix mixdown parameters to prevent clipping when downmixing from 5.1/7.1
+                av_opt_set_double(resampler_, "rematrix_volume", 1.0, 0);
+
+                const int swrInitResult = swr_init(resampler_);
+                if (swrInitResult < 0) {
+                    av_frame_unref(frame_);
+                    throw std::runtime_error("Cannot initialize streaming resampler: " + ffmpegError(swrInitResult));
+                }
+
+                av_channel_layout_uninit(&currentLayout_);
+                av_channel_layout_copy(&currentLayout_, &frame_->ch_layout);
+            }
+
             const int dstSamples = av_rescale_rnd(
-                swr_get_delay(resampler_, codecContext_->sample_rate) + frame_->nb_samples,
+                swr_get_delay(resampler_, frame_->sample_rate) + frame_->nb_samples,
                 kOutputSampleRate,
-                codecContext_->sample_rate,
+                frame_->sample_rate,
                 AV_ROUND_UP);
 
             pendingSamples_.assign(static_cast<std::size_t>(dstSamples) * kOutputChannels, 0);

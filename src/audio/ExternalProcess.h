@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// RetroWave - Copyright (C) 2026 Viktor Voloshko
+
 #pragma once
 
 #include <cstdio>
@@ -21,7 +24,7 @@ class ExternalProcess {
     [[nodiscard]] bool startStdout(const std::vector<std::string>& args);
     [[nodiscard]] static std::string captureStdout(const std::vector<std::string>& args);
 
-    [[nodiscard]] FILE* stdoutStream() const noexcept;
+    [[nodiscard]] int stdoutFd() const noexcept;
     [[nodiscard]] bool active() const noexcept;
 
     void requestStop() noexcept;
@@ -31,7 +34,7 @@ class ExternalProcess {
   private:
     void closeStdout() noexcept;
 
-    FILE* stdout_ = nullptr;
+    int stdoutFd_ = -1;
     pid_t pid_ = -1;
 };
 

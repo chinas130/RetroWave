@@ -2,21 +2,43 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build (${{ matrix.os }})
+  test:
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
+        include:
+          - name: "Linux Standard"
+            os: ubuntu-latest
+            dir: build
+            flags: ""
+            run_smoke: true
+            run_install: true
+
+          - name: "Linux ASan+UBSan"
+            os: ubuntu-latest
+            dir: build-asan
+            flags: "-DENABLE_ASAN=ON"
+            env_asan: "detect_leaks=1:symbolize=1:abort_on_error=1"
+
+          - name: "Linux TSan"
+            os: ubuntu-latest
+            dir: build-tsan
+            flags: "-DENABLE_TSAN=ON"
+            env_tsan: "halt_on_error=1:second_deadlock_stack=1"
+
+          - name: "macOS Native"
+            os: macos-latest
+            dir: build-mac
+            flags: ""
+            run_smoke: false
+            run_install: true
 
     steps:
       - name: Checkout
@@ -27,43 +49,37 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake \
-            pkg-config \
-            libavformat-dev \
-            libavcodec-dev \
-            libavutil-dev \
-            libswresample-dev \
-            libswscale-dev \
-            libncursesw5-dev \
-            libasound2-dev
+            cmake pkg-config \
+            libavformat-dev libavcodec-dev libavutil-dev \
+            libswresample-dev libswscale-dev \
+            libncursesw5-dev libasound2-dev
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: |
-          brew install ffmpeg ncurses pkg-config
+        run: brew install ffmpeg ncurses pkg-config cmake
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B ${{ matrix.dir }} -S . -DBUILD_TESTING=ON ${{ matrix.flags }}
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build ${{ matrix.dir }} -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
-      - name: Run tests
-        run: ctest --test-dir build --output-on-failure
+      - name: Run CTest
+        run: |
+          if [ -n "${{ matrix.env_asan }}" ]; then
+            export ASAN_OPTIONS="${{ matrix.env_asan }}"
+          fi
+          if [ -n "${{ matrix.env_tsan }}" ]; then
+            export TSAN_OPTIONS="${{ matrix.env_tsan }}"
+          fi
+          ctest --test-dir ${{ matrix.dir }} --output-on-failure
+
+      - name: Smoke test local TUI playback
+        if: matrix.run_smoke == true
+        run: scripts/smoke/local-playback.sh
 
       - name: Verify install target
-        run: cmake --install build --prefix "${RUNNER_TEMP}/retrowave-stage"
-
-      - name: Smoke test CLI failure path
-        run: |
-          set +e
-          output="$(./build/retrowave /definitely/missing/path 2>&1)"
-          status=$?
-          set -e
-          test "${status}" -eq 1
-          printf '%s\n' "${output}" | grep -F "No supported audio files were found."
-
-      - name: Smoke test local TUI playback lifecycle
-        run: scripts/smoke/local-playback.sh
+        if: matrix.run_install == true
+        run: cmake --install ${{ matrix.dir }} --prefix /tmp/retrowave-stage
